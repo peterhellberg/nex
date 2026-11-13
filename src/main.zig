@@ -309,7 +309,7 @@ const View = struct {
     /// like" mode reports render=3840 while drawing onto 1920x1080), which
     /// would put the picture in a corner. When, and only when, the monitor
     /// size disagrees with the render size, map against the monitor and take
-    /// over the viewport in present().
+    /// over the viewport in draw().
     fn fit(integer: bool) View {
         const mon = rl.GetCurrentMonitor();
         const mismatch = rl.IsWindowFullscreen() and
@@ -348,12 +348,12 @@ const View = struct {
         return std.math.clamp(p, 0, lim - 1);
     }
 
-    fn present(v: View, screen: rl.Texture2D) void {
+    /// Begin the frame and draw it; the caller ends it with rl.EndDrawing().
+    fn draw(v: View, screen: rl.Texture2D) void {
         const src: rl.Rectangle = .{ .x = 0, .y = 0, .width = W, .height = H };
         const dw = W * v.scale;
         const dh = H * v.scale;
         rl.BeginDrawing();
-        defer rl.EndDrawing();
         rl.ClearBackground(rl.BLACK);
         if (!v.surface_mismatch) {
             rl.DrawTexturePro(screen, src, .{ .x = v.ox, .y = v.oy, .width = dw, .height = dh }, .{ .x = 0, .y = 0 }, 0, rl.WHITE);
@@ -424,7 +424,8 @@ fn runWindow(gpa: std.mem.Allocator, io: std.Io, cart: *Cart, opts: Options, ini
     rl.InitWindow(W * opts.scale, H * opts.scale, console.title().ptr);
     defer rl.CloseWindow();
     console.title_dirty = false;
-    rl.SetTargetFPS(60);
+    // No raylib frame limiter: Pacer presents on an absolute 60 Hz schedule.
+    rl.SetTargetFPS(0);
 
     var screen = try makeScreen();
     defer rl.UnloadTexture(screen);
@@ -440,23 +441,13 @@ fn runWindow(gpa: std.mem.Allocator, io: std.Io, cart: *Cart, opts: Options, ini
     var poll: u32 = 0;
     var reload_pressed = false;
 
-    // Fixed 60 TPS from the wall clock, not one tick per frame, so 120/144 Hz
-    // displays don't run carts fast.
-    var acc: f64 = 0;
-    var prev_time = rl.GetTime();
+    var pacer: Pacer = .init();
+    var due: u32 = 1; // cart ticks to run this frame
 
     while (!rl.WindowShouldClose()) {
         if (latchKeyPresses()) reload_pressed = true;
 
-        const now = rl.GetTime();
-        var dt = now - prev_time;
-        prev_time = now;
-        if (dt > 0.25) dt = 0; // hidden/minimized: don't fast-forward
-        acc = @min(acc + dt, 5 * tick_dt); // slow frames: no catch-up burst
-
         const super = superDown();
-        // Latched per frame: IsKeyPressed lasts one frame, and a 144 Hz frame
-        // often runs zero ticks. Consumed by the next tick.
         reload_pressed = reload_pressed or (super and rl.IsKeyPressed(rl.KEY_R));
 
         if (super and rl.IsKeyPressed(rl.KEY_ENTER)) {
@@ -487,10 +478,9 @@ fn runWindow(gpa: std.mem.Allocator, io: std.Io, cart: *Cart, opts: Options, ini
         const view = View.fit(integer_scale);
         pollInput(view);
 
-        // Fixed-rate cart ticks: 0, 1 or a few catch-up ticks per frame.
-        // Reload checks run at tick rate so -w polls every 0.5 s at any Hz.
-        var ticked = false;
-        while (acc >= tick_dt) : (acc -= tick_dt) {
+        // One cart tick per frame, plus catch-up ticks if the loop fell
+        // behind. Reload checks run at tick rate so -w polls every 0.5 s.
+        for (0..due) |_| {
             var want_reload = reload_pressed;
             reload_pressed = false;
             if (opts.watch) {
@@ -506,14 +496,60 @@ fn runWindow(gpa: std.mem.Allocator, io: std.Io, cart: *Cart, opts: Options, ini
             cart.update() catch return error.CartTrap;
             console.input.endTick();
             if (console.tone_used) audio.ensureStream();
-            ticked = true;
         }
-        if (ticked) rl.UpdateTexture(screen, &console.gfx.fb);
+        rl.UpdateTexture(screen, &console.gfx.fb);
         if (console.title_dirty) applyTitle();
 
-        view.present(screen);
+        view.draw(screen);
+        // Wait between drawing and the swap, so the frame is shown on its
+        // deadline and EndDrawing's input poll lands just before the next tick.
+        due = pacer.wait();
+        rl.EndDrawing();
     }
 }
+
+/// Paces the window loop at exactly 60 frames per second, one cart tick each.
+///
+/// A relative limiter (raylib's SetTargetFPS) sleeps a frame's worth after
+/// each frame, and its oversleep accumulates: frames averaged ~16.84 ms on a
+/// 120 Hz Mac, so every ~100 frames the cart clock had to run two ticks in
+/// one frame and the picture visibly hitched. Vsync can't pace instead: on
+/// macOS it is not reliably honored (frames came back 0.5-19 ms apart).
+///
+/// Pacer keeps absolute deadlines, so oversleep never accumulates, and a late
+/// frame is absorbed by the next deadline rather than doubled up. Measured on
+/// the same Mac: 600 of 600 frames ran one tick, swaps 16.667 ms apart
+/// (sd 0.21 ms).
+const Pacer = struct {
+    next: f64,
+
+    /// Behind by more than this many ticks (a hidden window, a debugger
+    /// stop): resynchronize instead of bursting through the backlog.
+    const max_catch_up = 4;
+
+    fn init() Pacer {
+        return .{ .next = rl.GetTime() + tick_dt };
+    }
+
+    /// Wait for the current deadline, then return how many cart ticks are
+    /// due next frame: 1 normally, more if the loop has fallen behind.
+    fn wait(p: *Pacer) u32 {
+        // WaitTime sleeps most of the way and busy-waits the last 5%, which
+        // lands within ~0.6 ms of the deadline without spinning a core.
+        rl.WaitTime(p.next - rl.GetTime());
+
+        p.next += tick_dt;
+        const behind = rl.GetTime() - p.next;
+        if (behind < 0) return 1;
+        if (behind > max_catch_up * tick_dt) {
+            p.next = rl.GetTime() + tick_dt;
+            return 1;
+        }
+        const extra: u32 = @intFromFloat(@floor(behind / tick_dt) + 1);
+        p.next += @as(f64, @floatFromInt(extra)) * tick_dt;
+        return 1 + extra;
+    }
+};
 
 // ---- input ------------------------------------------------------------------
 
