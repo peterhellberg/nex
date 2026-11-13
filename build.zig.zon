@@ -1,0 +1,26 @@
+.{
+    .name = .nex,
+    .version = "0.1.0",
+    .fingerprint = 0xfb5c59d4569d20c9, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        .raylib = .{
+            .url = "https://github.com/raysan5/raylib/archive/refs/tags/6.2.tar.gz",
+            .hash = "raylib-6.0.0-whq8uDpYOAVcH_KyOZ0--nYF1dEsjdQ5r4e9R24UkQOi",
+            .lazy = true,
+        },
+        .wasm3 = .{
+            .url = "https://github.com/peterhellberg/wasm3/archive/66860a9072e2bf7dd01fa3bc1eae490515772341.tar.gz",
+            .hash = "N-V-__8AAOgArQBJTeiWMm30--7kFTPBKxaqoijyi-2md7uA",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "vex.h",
+        "vex.zig",
+    },
+}
