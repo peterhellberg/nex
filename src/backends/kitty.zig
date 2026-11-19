@@ -437,11 +437,13 @@ pub const Backend = struct {
             const end = @min(pos + chunk_len, encoded.len);
             const more = end < encoded.len;
             if (index == 0) {
-                b.out.print("\x1b_Ga=T,f=32,s={d},v={d},o=z,q=2,C=1,c={d},r={d},m={d};", .{
+                // Fixed id: re-transmitting it replaces the previous frame's
+                // image and placement instead of stacking new id-0 images.
+                b.out.print("\x1b_Ga=T,i=1,f=32,s={d},v={d},o=z,q=1,C=1,c={d},r={d},m={d};", .{
                     W, H, b.layout.place_cols, b.layout.place_rows, @intFromBool(more),
                 });
             } else {
-                b.out.print("\x1b_Gq=2,m={d};", .{@intFromBool(more)});
+                b.out.print("\x1b_Gq=1,m={d};", .{@intFromBool(more)});
             }
             b.out.writeAll(encoded[pos..end]);
             b.out.writeAll("\x1b\\");
@@ -476,6 +478,9 @@ pub const Backend = struct {
 };
 
 fn compressFrame(src: []const u8) []const u8 {
+    // shortcut: full-frame zlib is enough (a typical cart frame is ~4 KiB
+    // compressed, ~6 KiB on the wire); revisit dirty rows only if 60 fps
+    // measurement on a real terminal shows a bottleneck.
     var w: std.Io.Writer = .fixed(&zbuf);
     const c = std.compress.flate.Compress.init(&w, &history, .zlib, .{
         .good = 4,
