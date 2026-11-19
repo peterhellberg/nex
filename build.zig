@@ -113,7 +113,10 @@ pub fn build(b: *std.Build) void {
         addRaylib(host_mod, raylib_dep, linux_display_backend);
     }
 
-    const exe = b.addExecutable(.{ .name = "nex", .root_module = host_mod });
+    const exe = b.addExecutable(.{
+        .name = if (backend_kind == .kitty) "kex" else "nex",
+        .root_module = host_mod,
+    });
     if (target.result.os.tag == .windows) exe.subsystem = .windows;
     b.installArtifact(exe);
 
