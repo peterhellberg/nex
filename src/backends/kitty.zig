@@ -541,10 +541,6 @@ pub const Backend = struct {
         b.out.print("\x1b[{d};{d}H", .{ row, col });
         const id = b.next_id;
         b.next_id += 1;
-        if (full and id > 1) {
-            // Drop all earlier placements; the fresh full frame replaces them.
-            b.out.print("\x1b_Ga=d,d=R,x=1,y={d},q=1\x1b\\", .{id - 1});
-        }
         var pos: usize = 0;
         var index: usize = 0;
         while (pos < encoded.len) : (index += 1) {
@@ -563,6 +559,12 @@ pub const Backend = struct {
             b.out.writeAll("\x1b\\");
             b.out.flush();
             pos = end;
+        }
+        // Delete old placements only after the new frame is on screen,
+        // otherwise there is a black frame between delete and placement.
+        if (full and id > 1) {
+            b.out.print("\x1b_Ga=d,d=R,x=1,y={d},q=1\x1b\\", .{id - 1});
+            b.out.flush();
         }
     }
 
