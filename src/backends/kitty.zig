@@ -1,13 +1,10 @@
-//! Terminal backend: Kitty Graphics Protocol for output, Kitty keyboard and
-//! SGR mouse protocols for input. No third-party code: everything here is Zig,
-//! escape sequences and POSIX syscalls.
+//! Terminal backend: Kitty Graphics Protocol output, Kitty keyboard and SGR
+//! mouse input. Pure Zig plus POSIX syscalls; no terminal library.
 //!
-//! The cart still draws into its 320x180 RGBA framebuffer. Each changed frame
-//! is nearest-neighbour upscaled in Zig to the exact pixel size of the cell
-//! rectangle it occupies, then zlib-compressed and sent as a chunked `a=T`
-//! placement. Sending it at native pixel size avoids the terminal's fuzzy
-//! bilinear scaling. There is no terminal audio or gamepad API, so this
-//! backend leaves console.synth null and reads no pads.
+//! The cart's 320x180 RGBA framebuffer is nearest-neighbour upscaled in Zig to
+//! the exact pixel size of its cell rectangle, then zlib-compressed and sent
+//! as chunked `a=T` placements. Only changed rectangles are retransmitted.
+//! There is no terminal audio or gamepad API, so console.synth stays null.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,75 +15,93 @@ const gfx = @import("../gfx.zig");
 const W = gfx.W;
 const H = gfx.H;
 const tick_ns: i96 = std.time.ns_per_s / 60;
-/// Base64 bytes per APC chunk. Must be a multiple of four.
-const chunk_len = 4096;
-const fallback_cell_w = 10;
-const fallback_cell_h = 20;
+const chunk_len = 4096; // base64 bytes per APC chunk, multiple of four
+const cell_fallback: Cell = .{ .w = 10, .h = 20 };
+const apc = "\x1b_G";
+const apc_end = "\x1b\\";
+const query = apc ++ "i=31,s=1,v=1,a=q,t=d,f=24;AAAA" ++ apc_end ++ "\x1b[c\x1b[16t";
+const enter_seq = "\x1b[?1049h\x1b[?25l\x1b[0m\x1b[2J\x1b[H\x1b[>3u\x1b[?1002h\x1b[?1006h";
+const leave_seq = "\x1b[<u\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l";
+/// Ghostty evicts oldest images past ~10 MB of decoded RGBA; a hole is left.
+const storage_budget = 6 * 1024 * 1024;
+const max_live_images = 64;
 
-// The deflate compressor (~220 KiB) is reused across frames; frame-sized
-// scratch is allocated per terminal size.
+// Reused across frames; frame-sized scratch is allocated per terminal size.
 var history: [std.compress.flate.max_window_len]u8 = undefined;
 var compressor: std.compress.flate.Compress = undefined;
 var detect_buf: [4096]u8 = undefined;
 var prev_fb: [W * H]u32 = @splat(0xffffffff);
 
-/// Ghostty stores decoded RGBA and evicts oldest images past ~10 MB; an
-/// eviction leaves a hole. Keep live placements well under that budget, and
-/// refresh in one piece before it can happen. Dirty rects use fresh ids so
-/// they never remove an unrelated part of the screen.
-const storage_budget = 6 * 1024 * 1024;
-const max_live_images = 64;
+const Cell = struct { w: u16, h: u16 };
+const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
+const FrameData = struct { data: []const u8, compressed: bool };
 
 const Layout = struct {
     cols: u16,
     rows: u16,
-    cell_w: u16,
-    cell_h: u16,
-    /// Cell rectangle the picture occupies, centered in the terminal.
+    cell: Cell,
     place_cols: u16,
     place_rows: u16,
-    /// Native pixel size of that rectangle; the image is upscaled to this.
     out_w: u32,
     out_h: u32,
     off_col: u16,
     off_row: u16,
 
-    fn compute(cols_raw: u16, rows_raw: u16, cw: u16, ch: u16) Layout {
-        const cols: u16 = @max(cols_raw, 1);
-        const rows: u16 = @max(rows_raw, 1);
-        const s = @min(
-            @as(f32, @floatFromInt(cols * cw)) / @as(f32, W),
-            @as(f32, @floatFromInt(rows * ch)) / @as(f32, H),
-        );
-        const pc = clampCells(@as(f32, W) * s / @as(f32, cw), cols);
-        const pr = clampCells(@as(f32, H) * s / @as(f32, ch), rows);
+    fn compute(cols: u16, rows: u16, cw: u16, ch: u16) Layout {
+        const c: u16 = @max(cols, 1);
+        const r: u16 = @max(rows, 1);
+        const s = @min(@as(f32, @floatFromInt(c * cw)) / W, @as(f32, @floatFromInt(r * ch)) / H);
+        const pc = cells(@as(f32, W) * s / cw, c);
+        const pr = cells(@as(f32, H) * s / ch, r);
         return .{
-            .cols = cols,
-            .rows = rows,
-            .cell_w = cw,
-            .cell_h = ch,
-            .place_cols = pc,
-            .place_rows = pr,
-            .out_w = @as(u32, pc) * cw,
-            .out_h = @as(u32, pr) * ch,
-            .off_col = (cols - pc) / 2 + 1,
-            .off_row = (rows - pr) / 2 + 1,
+            .cols = c, .rows = r, .cell = .{ .w = cw, .h = ch },
+            .place_cols = pc, .place_rows = pr,
+            .out_w = @as(u32, pc) * cw, .out_h = @as(u32, pr) * ch,
+            .off_col = (c - pc) / 2 + 1, .off_row = (r - pr) / 2 + 1,
         };
     }
 
-    fn clampCells(v: f32, max: u16) u16 {
-        const n: u32 = @intFromFloat(@max(@floor(v + 0.00001), 1));
-        return @intCast(@min(n, max));
+    fn cells(v: f32, max: u16) u16 {
+        return @intCast(@min(@as(u32, @intFromFloat(@max(@floor(v + 0.00001), 1))), max));
     }
 
-    /// SGR mouse reports 1-based cells. Map through the placement rectangle
-    /// into the original framebuffer coordinates.
-    fn mouseAxis(l: Layout, comptime x_axis: bool, cell: i32) i32 {
-        const count: u32 = if (x_axis) l.place_cols else l.place_rows;
+    /// SGR mouse reports 1-based cells; map through the placement rectangle.
+    fn mouseAxis(l: Layout, comptime x_axis: bool, cell_pos: i32) i32 {
+        const count: f32 = @floatFromInt(if (x_axis) l.place_cols else l.place_rows);
         const size: u32 = if (x_axis) W else H;
-        const px = @as(f32, @floatFromInt(cell - (if (x_axis) l.off_col else l.off_row))) *
-            @as(f32, @floatFromInt(size)) / @as(f32, @floatFromInt(count));
+        const origin: i32 = if (x_axis) l.off_col else l.off_row;
+        const px = @as(f32, @floatFromInt(cell_pos - origin)) * @as(f32, @floatFromInt(size)) / count;
         return std.math.clamp(@as(i32, @intFromFloat(@round(px))), 0, @as(i32, @intCast(size)) - 1);
+    }
+};
+
+const Buffers = struct {
+    scaled: []u32 = &.{},
+    zbuf: []u8 = &.{},
+    b64: []u8 = &.{},
+    sx: []u16 = &.{},
+    sy: []u16 = &.{},
+
+    fn deinit(b: *Buffers, gpa: std.mem.Allocator) void {
+        inline for (.{ "scaled", "zbuf", "b64", "sx", "sy" }) |name| gpa.free(@field(b, name));
+        b.* = .{};
+    }
+
+    fn alloc(b: *Buffers, gpa: std.mem.Allocator, l: Layout) !void {
+        const pixels = @as(usize, l.out_w) * l.out_h;
+        const zlen = pixels * 4 + 4096;
+        const next = Buffers{
+            .scaled = try gpa.alloc(u32, pixels),
+            .zbuf = try gpa.alloc(u8, zlen),
+            .b64 = try gpa.alloc(u8, (zlen * 4 + 2) / 3 + 4),
+            .sx = try gpa.alloc(u16, l.out_w),
+            .sy = try gpa.alloc(u16, l.out_h),
+        };
+        errdefer next.deinit(gpa);
+        for (next.sx, 0..) |*slot, x| slot.* = @intCast(@min(x * W / l.out_w, W - 1));
+        for (next.sy, 0..) |*slot, y| slot.* = @intCast(@min(y * H / l.out_h, H - 1));
+        b.deinit(gpa);
+        b.* = next;
     }
 };
 
@@ -95,13 +110,10 @@ const Out = struct {
     end: usize = 0,
 
     fn writeAll(o: *Out, s: []const u8) void {
-        var i: usize = 0;
-        while (i < s.len) {
+        for (s) |ch| {
             if (o.end == o.buf.len) o.flush();
-            const n = @min(o.buf.len - o.end, s.len - i);
-            @memcpy(o.buf[o.end..][0..n], s[i..][0..n]);
-            o.end += n;
-            i += n;
+            o.buf[o.end] = ch;
+            o.end += 1;
         }
     }
 
@@ -113,7 +125,7 @@ const Out = struct {
     fn flush(o: *Out) void {
         var i: usize = 0;
         while (i < o.end) {
-            const n = sysWrite(1, o.buf[i..o.end]);
+            const n = sysIo(1, o.buf[i..o.end], true);
             if (n == 0) break;
             i += n;
         }
@@ -121,24 +133,20 @@ const Out = struct {
     }
 };
 
-fn sysWrite(fd: posix.fd_t, bytes: []const u8) usize {
+fn sysIo(fd: posix.fd_t, bytes: []u8, writing: bool) usize {
     while (true) {
-        const rc = posix.system.write(fd, bytes.ptr, bytes.len);
+        const rc = if (writing)
+            posix.system.write(fd, bytes.ptr, bytes.len)
+        else
+            posix.system.read(fd, bytes.ptr, bytes.len);
         const err = posix.errno(rc);
         if (err == .INTR) continue;
-        if (err != .SUCCESS) return 0;
-        return @intCast(rc);
+        return if (err == .SUCCESS) @intCast(rc) else 0;
     }
 }
 
 fn sysRead(fd: posix.fd_t, bytes: []u8) usize {
-    while (true) {
-        const rc = posix.system.read(fd, bytes.ptr, bytes.len);
-        const err = posix.errno(rc);
-        if (err == .INTR) continue;
-        if (err != .SUCCESS) return 0;
-        return @intCast(rc);
-    }
+    return sysIo(fd, bytes, false);
 }
 
 fn inputReady(timeout_ms: i32) bool {
@@ -151,28 +159,41 @@ fn terminalSize() ?posix.winsize {
     if (builtin.os.tag != .linux) return null;
     var ws: posix.winsize = undefined;
     const rc = std.os.linux.ioctl(0, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws));
-    if (std.posix.errno(rc) != .SUCCESS) return null;
-    return ws;
+    return if (posix.errno(rc) == .SUCCESS) ws else null;
 }
 
-fn parseCellSize(buf: []const u8) ?struct { w: u16, h: u16 } {
-    // XTWINOPS answers CSI 16t with CSI 6;<height>;<width>t (Ghostty, VTE).
-    const needle = "\x1b[6;";
-    const at = std.mem.indexOf(u8, buf, needle) orelse return null;
-    var i = at + needle.len;
-    const sep = std.mem.indexOfScalarPos(u8, buf, i, ';') orelse return null;
-    const h = std.fmt.parseInt(u16, buf[i..sep], 10) catch return null;
-    i = sep + 1;
-    const end = std.mem.indexOfScalarPos(u8, buf, i, 't') orelse return null;
-    const w = std.fmt.parseInt(u16, buf[i..end], 10) catch return null;
-    if (w == 0 or h == 0) return null;
-    return .{ .w = w, .h = h };
+/// XTWINOPS answers CSI 16t with CSI 6;<height>;<width>t (Ghostty, VTE).
+fn parseCellSize(buf: []const u8) ?Cell {
+    const at = std.mem.indexOf(u8, buf, "\x1b[6;") orelse return null;
+    const rest = buf[at + 4 ..];
+    const sep = std.mem.indexOfScalar(u8, rest, ';') orelse return null;
+    const end = std.mem.indexOfScalar(u8, rest, 't') orelse return null;
+    const h = std.fmt.parseInt(u16, rest[0..sep], 10) catch return null;
+    const w = std.fmt.parseInt(u16, rest[sep + 1 .. end], 10) catch return null;
+    return if (w == 0 or h == 0) null else .{ .w = w, .h = h };
+}
+
+fn setRawMode(saved: posix.termios) !void {
+    var raw = saved;
+    raw.iflag.BRKINT = false;
+    raw.iflag.ICRNL = false;
+    raw.iflag.IXON = false;
+    raw.oflag.OPOST = false;
+    raw.cflag.CSIZE = .CS8;
+    raw.lflag.ISIG = false;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.lflag.IEXTEN = false;
+    raw.cc[@intFromEnum(posix.V.MIN)] = 1;
+    raw.cc[@intFromEnum(posix.V.TIME)] = 0;
+    try posix.tcsetattr(0, .NOW, raw);
 }
 
 // ---- input parsing ----------------------------------------------------------
 
 const Parser = struct {
     const State = enum { ground, esc, csi, apc, apc_esc, osc, osc_esc };
+    const Key = struct { code: u32, mods: u32, event: u32 };
 
     state: State = .ground,
     seq: [48]u8 = undefined,
@@ -199,12 +220,10 @@ const Parser = struct {
     fn one(p: *Parser, ch: u8) void {
         switch (p.state) {
             .ground => {
-                if (ch == 0x1b) {
-                    p.state = .esc;
-                } else if (ch == 0x03) {
+                if (ch == 0x1b) p.state = .esc else if (ch == 0x03) {
                     p.quit = true; // Ctrl+C, legacy encoding
                 } else if (ch >= 0x20 and ch < 0x7f) {
-                    p.key(ch, 0, 1);
+                    p.keyEvent(.{ .code = ch, .mods = 0, .event = 1 });
                     if (ch == 'z') p.text_held |= 1 << 4;
                     if (ch == 'x') p.text_held |= 1 << 5;
                 }
@@ -239,52 +258,32 @@ const Parser = struct {
     fn dispatch(p: *Parser, final: u8) void {
         const params = p.seq[0..p.seq_len];
         switch (final) {
-            'u' => {
-                var it = std.mem.splitScalar(u8, params, ';');
-                const code = fieldInt(it.next() orelse "", 0);
-                const mods_field = it.next() orelse "1";
-                p.key(code, modBits(mods_field), eventOf(mods_field, it.next()));
-            },
-            'A', 'B', 'C', 'D' => {
-                const code: u32 = switch (final) {
-                    'A' => 57348,
-                    'B' => 57349,
-                    'C' => 57350,
-                    'D' => 57351,
-                    else => unreachable,
-                };
-                var it = std.mem.splitScalar(u8, params, ';');
-                _ = it.next(); // the leading 1
-                const mods_field = it.next() orelse "1";
-                p.key(code, modBits(mods_field), eventOf(mods_field, it.next()));
-            },
+            'u' => p.keyEvent(parseKey(params, null)),
+            'A', 'B', 'C', 'D' => p.keyEvent(parseKey(params, final)),
             'M', 'm' => {
                 if (params.len == 0 or params[0] != '<') return;
                 var it = std.mem.splitScalar(u8, params[1..], ';');
-                const b = fieldInt(it.next() orelse "", 0);
-                const x = fieldInt(it.next() orelse "", 1);
-                const y = fieldInt(it.next() orelse "", 1);
+                const b = num(it.next() orelse "", 0);
+                const x = num(it.next() orelse "", 1);
+                const y = num(it.next() orelse "", 1);
                 p.mouseEvent(b, x, y, final == 'M');
             },
             else => {}, // DA1, CSI 16t, window reports: not input
         }
     }
 
-    fn key(p: *Parser, code: u32, mods: u32, event: u32) void {
-        const released = event == 3;
-        if (code == 27) {
+    fn keyEvent(p: *Parser, k: Key) void {
+        const released = k.event == 3;
+        if (k.code == 27) {
             if (!released) p.quit = true;
             return;
         }
-        if (code == 'c' and (mods & 4) != 0) {
-            if (!released) p.quit = true; // Ctrl+C, Kitty encoding
-            return;
+        if ((k.mods & 4) != 0 and !released) {
+            if (k.code == 'c') p.quit = true;
+            if (k.code == 'r') p.reload = true;
+            if (k.code == 'c' or k.code == 'r') return;
         }
-        if (code == 'r' and (mods & 4) != 0) {
-            if (!released) p.reload = true; // Super is not reportable: Ctrl+R
-            return;
-        }
-        const button: u4 = switch (code) {
+        const button: u4 = switch (k.code) {
             57351 => 0, // left
             57350 => 1, // right
             57348 => 2, // up
@@ -293,17 +292,13 @@ const Parser = struct {
             'x' => 5,
             else => return,
         };
-        p.setButton(button, event);
-    }
-
-    fn setButton(p: *Parser, button: u4, event: u32) void {
         const bit: u8 = @as(u8, 1) << @intCast(button);
         p.text_held &= ~bit;
-        if (event == 3) {
+        if (released) {
             p.held &= ~bit;
         } else {
             p.held |= bit;
-            if (event == 1) p.pressed |= bit;
+            if (k.event == 1) p.pressed |= bit;
         }
     }
 
@@ -312,22 +307,37 @@ const Parser = struct {
         p.mouse_y = p.layout.mouseAxis(false, @intCast(y));
         if ((b & 32) != 0) return; // motion: coords only
         const which = b & 3;
+        const bit: u8 = @as(u8, 1) << @intCast(which);
         if (which == 3) {
             p.mouse = 0;
         } else if (down) {
-            p.mouse |= @as(u8, 1) << @intCast(which);
+            p.mouse |= bit;
         } else {
-            p.mouse &= ~(@as(u8, 1) << @intCast(which));
+            p.mouse &= ~bit;
         }
     }
 };
 
-fn fieldInt(s: []const u8, default: u32) u32 {
-    const end = std.mem.indexOfScalar(u8, s, ':') orelse s.len;
+/// `CSI code;mods:event u` and `CSI 1;mods:event A` share the same fields.
+fn parseKey(params: []const u8, arrow: ?u8) Parser.Key {
+    const codes = [_]u32{ 57348, 57349, 57350, 57351 }; // up down right left
+    const finals = "ABCD";
+    const code = if (arrow) |a|
+        codes[@intCast(std.mem.indexOfScalar(u8, finals, a) orelse 0)]
+    else
+        num(params, 0);
+    var it = std.mem.splitScalar(u8, params, ';');
+    _ = it.next(); // the key code (or the leading 1 for arrows)
+    const mods = it.next() orelse "1";
+    return .{ .code = code, .mods = subNum(mods, 0, 1) -| 1, .event = eventOf(mods, it.next()) };
+}
+
+fn num(s: []const u8, default: u32) u32 {
+    const end = std.mem.indexOfAny(u8, s, ":;") orelse s.len;
     return std.fmt.parseInt(u32, s[0..end], 10) catch default;
 }
 
-fn subInt(s: []const u8, index: usize, default: u32) u32 {
+fn subNum(s: []const u8, index: usize, default: u32) u32 {
     var it = std.mem.splitScalar(u8, s, ':');
     var i: usize = 0;
     while (it.next()) |part| : (i += 1) {
@@ -336,17 +346,9 @@ fn subInt(s: []const u8, index: usize, default: u32) u32 {
     return default;
 }
 
-/// `CSI code;mods:event u` carries the event type as a subfield of modifiers.
-/// Some terminals put it in a third semicolon field instead.
-fn eventOf(mods_field: []const u8, extra: ?[]const u8) u32 {
-    const e = subInt(mods_field, 1, 0);
-    if (e != 0) return e;
-    if (extra) |s| return fieldInt(s, 1);
-    return 1;
-}
-
-fn modBits(s: []const u8) u32 {
-    return fieldInt(s, 1) -| 1;
+fn eventOf(mods: []const u8, extra: ?[]const u8) u32 {
+    const e = subNum(mods, 1, 0);
+    return if (e != 0) e else if (extra) |s| num(s, 1) else 1;
 }
 
 // ---- backend ----------------------------------------------------------------
@@ -357,118 +359,64 @@ pub const Backend = struct {
     parser: Parser,
     saved_termios: posix.termios,
     layout: Layout,
+    buffers: Buffers = .{},
     next_ns: i96,
     next_id: u32 = 1,
     frames_sent: u32 = 0,
     live_bytes: u64 = 0,
-    scaled: []u32 = &.{},
-    zbuf: []u8 = &.{},
-    b64buf: []u8 = &.{},
-    /// Precomputed nearest-neighbour source coordinates (one per output row/col).
-    sx_map: []u16 = &.{},
-    sy_map: []u16 = &.{},
 
     pub fn init(cfg: backend.Config) !Backend {
         if (builtin.os.tag != .linux) @compileError("kitty backend requires Linux");
-
         const saved = try posix.tcgetattr(0);
-        var raw = saved;
-        raw.iflag.BRKINT = false;
-        raw.iflag.ICRNL = false;
-        raw.iflag.IXON = false;
-        raw.oflag.OPOST = false;
-        raw.cflag.CSIZE = .CS8;
-        raw.lflag.ISIG = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.ECHO = false;
-        raw.lflag.IEXTEN = false;
-        raw.cc[@intFromEnum(posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(posix.V.TIME)] = 0;
-        try posix.tcsetattr(0, .NOW, raw);
+        try setRawMode(saved);
         errdefer posix.tcsetattr(0, .NOW, saved) catch {};
 
         var self = Backend{
             .cfg = cfg,
             .parser = undefined,
             .saved_termios = saved,
-            .layout = Layout.compute(80, 24, fallback_cell_w, fallback_cell_h),
+            .layout = Layout.compute(80, 24, cell_fallback.w, cell_fallback.h),
             .next_ns = std.Io.Timestamp.now(cfg.io, .awake).toNanoseconds() + tick_ns,
         };
-
-        // Query action + DA1 + cell size. The query reply is the support test;
-        // DA1 and CSI 16t bound the read so we don't wait forever on a terminal
-        // that ignores the graphics protocol entirely.
-        self.out.writeAll("\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c\x1b[16t");
-        self.out.flush();
-        var len: usize = 0;
-        for (0..100) |_| {
-            if (!inputReady(10)) continue;
-            if (len < detect_buf.len) len += sysRead(0, detect_buf[len..]);
-            if (std.mem.indexOf(u8, detect_buf[0..len], "\x1b[c") != null and
-                parseCellSize(detect_buf[0..len]) != null) break;
-        }
-        if (std.mem.indexOf(u8, detect_buf[0..len], "\x1b_Gi=31;OK\x1b\\") == null) {
-            std.debug.print("nex: terminal does not support the kitty graphics protocol\n", .{});
-            return error.GraphicsUnsupported;
-        }
-        var cw: u16 = fallback_cell_w;
-        var ch: u16 = fallback_cell_h;
-        if (parseCellSize(detect_buf[0..len])) |cell| {
-            cw = cell.w;
-            ch = cell.h;
-        }
-
-        if (terminalSize()) |ws| self.layout = Layout.compute(ws.col, ws.row, cw, ch);
-        try self.allocBuffers();
+        const cell = try self.detect();
+        if (terminalSize()) |ws| self.layout = Layout.compute(ws.col, ws.row, cell.w, cell.h);
+        try self.buffers.alloc(cfg.gpa, self.layout);
         self.parser = Parser.init(self.layout);
 
-        self.out.writeAll("\x1b[?1049h\x1b[?25l\x1b[0m\x1b[2J\x1b[H");
-        self.out.writeAll("\x1b[>3u"); // Kitty keyboard: disambiguate + press/release
-        self.out.writeAll("\x1b[?1002h\x1b[?1006h"); // SGR mouse drag events
+        self.out.writeAll(enter_seq);
         self.out.flush();
         return self;
     }
 
-    fn allocBuffers(b: *Backend) !void {
-        const pixels = @as(usize, b.layout.out_w) * b.layout.out_h;
-        const zlen = pixels * 4 + 4096;
-        const scaled = try b.cfg.gpa.alloc(u32, pixels);
-        errdefer b.cfg.gpa.free(scaled);
-        const zbuf = try b.cfg.gpa.alloc(u8, zlen);
-        errdefer b.cfg.gpa.free(zbuf);
-        const b64buf = try b.cfg.gpa.alloc(u8, (zlen * 4 + 2) / 3 + 4);
-        const sx = try b.cfg.gpa.alloc(u16, b.layout.out_w);
-        errdefer b.cfg.gpa.free(sx);
-        const sy = try b.cfg.gpa.alloc(u16, b.layout.out_h);
-        errdefer b.cfg.gpa.free(sy);
-        for (sx, 0..) |*slot, x| slot.* = @intCast(@min(x * W / b.layout.out_w, W - 1));
-        for (sy, 0..) |*slot, y| slot.* = @intCast(@min(y * H / b.layout.out_h, H - 1));
-        b.cfg.gpa.free(b.scaled);
-        b.cfg.gpa.free(b.zbuf);
-        b.cfg.gpa.free(b.b64buf);
-        b.cfg.gpa.free(b.sx_map);
-        b.cfg.gpa.free(b.sy_map);
-        b.scaled = scaled;
-        b.zbuf = zbuf;
-        b.b64buf = b64buf;
-        b.sx_map = sx;
-        b.sy_map = sy;
+    /// Query action + DA1 + cell size. The query reply is the support test;
+    /// DA1 and CSI 16t bound the read on terminals without graphics support.
+    fn detect(b: *Backend) !Cell {
+        b.out.writeAll(query);
+        b.out.flush();
+        var len: usize = 0;
+        for (0..100) |_| {
+            if (!inputReady(10)) continue;
+            if (len < detect_buf.len) len += sysRead(0, detect_buf[len..]);
+            const buf = detect_buf[0..len];
+            if (std.mem.indexOf(u8, buf, "\x1b[c") != null and parseCellSize(buf) != null) break;
+        }
+        const buf = detect_buf[0..len];
+        if (std.mem.indexOf(u8, buf, apc ++ "i=31;OK" ++ apc_end) == null) {
+            std.debug.print("nex: terminal does not support the kitty graphics protocol\n", .{});
+            return error.GraphicsUnsupported;
+        }
+        return parseCellSize(buf) orelse cell_fallback;
     }
 
     pub fn deinit(b: *Backend) void {
-        b.cfg.gpa.free(b.scaled);
-        b.cfg.gpa.free(b.zbuf);
-        b.cfg.gpa.free(b.b64buf);
-        b.cfg.gpa.free(b.sx_map);
-        b.cfg.gpa.free(b.sy_map);
-        b.out.writeAll("\x1b[<u"); // pop keyboard flags
-        b.out.writeAll("\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+        b.buffers.deinit(b.cfg.gpa);
+        b.out.writeAll(leave_seq);
         b.out.flush();
         posix.tcsetattr(0, .NOW, b.saved_termios) catch {};
     }
 
     pub fn beginFrame(b: *Backend) !backend.Frame {
-        // A lone ESC (legacy terminals) has no terminator. With no byte after
+        // A lone ESC (legacy terminals) has no terminator: with no byte after
         // it by the next frame, it is the Escape key, not a sequence prefix.
         if (b.parser.state == .esc) {
             b.parser.quit = true;
@@ -476,16 +424,7 @@ pub const Backend = struct {
         }
         b.parser.held &= ~b.parser.text_held;
         b.parser.text_held = 0;
-        if (terminalSize()) |ws| {
-            const fresh = Layout.compute(ws.col, ws.row, b.layout.cell_w, b.layout.cell_h);
-            if (fresh.out_w != b.layout.out_w or fresh.out_h != b.layout.out_h) {
-                b.layout = fresh;
-                b.parser.layout = fresh;
-                try b.allocBuffers();
-                @memset(&prev_fb, 0xffffffff); // force a full redraw on resize
-                b.out.writeAll("\x1b[2J");
-            }
-        }
+        try b.updateLayout();
         var bytes: [4096]u8 = undefined;
         while (inputReady(0)) {
             const n = sysRead(0, &bytes);
@@ -505,21 +444,33 @@ pub const Backend = struct {
         return frame;
     }
 
+    fn updateLayout(b: *Backend) !void {
+        const ws = terminalSize() orelse return;
+        const fresh = Layout.compute(ws.col, ws.row, b.layout.cell.w, b.layout.cell.h);
+        if (fresh.out_w == b.layout.out_w and fresh.out_h == b.layout.out_h) return;
+        b.layout = fresh;
+        b.parser.layout = fresh;
+        try b.buffers.alloc(b.cfg.gpa, fresh);
+        @memset(&prev_fb, 0xffffffff); // force a full redraw on resize
+        b.out.writeAll("\x1b[2J");
+    }
+
     pub fn present(b: *Backend) u32 {
         const fb = b.cfg.console.gfx.bytes();
         if (dirtyRect(fb)) |rect| {
-            const area = @as(u32, rect.w) * rect.h;
-            const bytes: u64 = @as(u64, area) * b.layout.out_w / W * b.layout.out_h / H * 4;
+            const box = Box.compute(b.layout, rect);
+            const bytes: u64 = @as(u64, box.rw) * box.rh * 4;
             const full = b.frames_sent == 0 or b.frames_sent % max_live_images == 0 or
-                b.live_bytes + bytes > storage_budget or area * 10 > @as(u32, W) * H * 9;
-            b.sendFrame(fb, if (full) .{ .x = 0, .y = 0, .w = W, .h = H } else rect, full);
+                b.live_bytes + bytes > storage_budget or
+                @as(u64, rect.w) * rect.h * 10 > @as(u64, W) * H * 9;
+            b.send(fb, box, full);
             b.frames_sent += 1;
+            b.live_bytes = if (full) bytes else b.live_bytes + bytes;
         }
         return b.pace();
     }
 
-    /// Smallest bounding box of changed pixels in framebuffer coordinates.
-    /// prev_fb uses 0xffffffff as "never drawn", so the first frame is full.
+    /// Smallest bounding box of changed pixels. 0xffffffff means "never drawn".
     fn dirtyRect(fb_bytes: []const u8) ?Rect {
         const fb: []const u32 = @ptrCast(@alignCast(fb_bytes));
         var x0: usize = W;
@@ -540,24 +491,15 @@ pub const Backend = struct {
         return .{ .x = @intCast(x0), .y = @intCast(y0), .w = @intCast(x1 - x0 + 1), .h = @intCast(y1 - y0 + 1) };
     }
 
-    fn sendFrame(b: *Backend, fb_bytes: []const u8, dirty: Rect, full: bool) void {
+    fn send(b: *Backend, fb: []const u8, box: Box, full: bool) void {
         const l = b.layout;
-        // Map the dirty rect to output pixels, then snap to cell boundaries so
-        // the partial image lands exactly on the terminal's cell grid.
-        const px0 = (@as(u32, dirty.x) * l.out_w / W / l.cell_w) * l.cell_w;
-        const py0 = (@as(u32, dirty.y) * l.out_h / H / l.cell_h) * l.cell_h;
-        const px1 = ((@as(u32, dirty.x + dirty.w) * l.out_w + W - 1) / W + l.cell_w - 1) / l.cell_w * l.cell_w;
-        const py1 = ((@as(u32, dirty.y + dirty.h) * l.out_h + H - 1) / H + l.cell_h - 1) / l.cell_h * l.cell_h;
-        const rw: u32 = @min(px1 - px0, l.out_w - px0);
-        const rh: u32 = @min(py1 - py0, l.out_h - py0);
-
-        const src = nearestScale(b, fb_bytes, px0, py0, rw, rh);
-        const frame = compressFrame(b, src);
-        const encoded = std.base64.standard.Encoder.encode(b.b64buf, frame.data);
-
-        const col: u16 = l.off_col + @as(u16, @intCast(px0 / l.cell_w));
-        const row: u16 = l.off_row + @as(u16, @intCast(py0 / l.cell_h));
+        const src = upscale(b, fb, box);
+        const frame = compress(b, src);
+        const encoded = std.base64.standard.Encoder.encode(b.buffers.b64, frame.data);
+        const col = l.off_col + @as(u16, @intCast(box.px0 / l.cell.w));
+        const row = l.off_row + @as(u16, @intCast(box.py0 / l.cell.h));
         b.out.print("\x1b[{d};{d}H", .{ row, col });
+
         const id = b.next_id;
         b.next_id += 1;
         var pos: usize = 0;
@@ -568,31 +510,28 @@ pub const Backend = struct {
             if (index == 0) {
                 // No c/r: the image is already the exact pixel size of the
                 // cell rectangle, so the terminal displays it 1:1 (no blur).
-                b.out.print("\x1b_Ga=T,i={d},f=32,s={d},v={d},q=1,C=1,m={d}{s};", .{
-                    id, rw, rh, @intFromBool(more), if (frame.compressed) ",o=z" else "",
+                b.out.print(apc ++ "a=T,i={d},f=32,s={d},v={d},q=1,C=1,m={d}{s};", .{
+                    id, box.rw, box.rh, @intFromBool(more), if (frame.compressed) ",o=z" else "",
                 });
             } else {
-                b.out.print("\x1b_Gq=1,m={d};", .{@intFromBool(more)});
+                b.out.print(apc ++ "q=1,m={d};", .{@intFromBool(more)});
             }
             b.out.writeAll(encoded[pos..end]);
-            b.out.writeAll("\x1b\\");
+            b.out.writeAll(apc_end);
             b.out.flush();
             pos = end;
         }
-        // Delete old placements only after the new frame is on screen,
-        // otherwise there is a black frame between delete and placement.
+        // Delete only after the new frame is on screen, or there is a
+        // black frame between delete and placement.
         if (full and id > 1) {
-            b.out.print("\x1b_Ga=d,d=R,x=1,y={d},q=1\x1b\\", .{id - 1});
+            b.out.print(apc ++ "a=d,d=R,x=1,y={d},q=1" ++ apc_end, .{id - 1});
             b.out.flush();
         }
-        b.live_bytes = if (full) @as(u64, rw) * rh * 4 else b.live_bytes + @as(u64, rw) * rh * 4;
     }
 
-    /// Same absolute-deadline pacing as the desktop backend, so cart ticks
-    /// stay at 60 Hz even when a terminal drops a presentation frame.
+    /// Absolute-deadline pacing: 60 cart ticks even if a frame is dropped.
     fn pace(b: *Backend) u32 {
-        const t0 = nowNs(b.cfg.io);
-        const remain = b.next_ns - t0;
+        const remain = b.next_ns - nowNs(b.cfg.io);
         if (remain > 0) std.Io.sleep(b.cfg.io, .{ .nanoseconds = remain }, .awake) catch {};
         b.next_ns += tick_ns;
         const behind = nowNs(b.cfg.io) - b.next_ns;
@@ -606,115 +545,112 @@ pub const Backend = struct {
         return 1 + extra;
     }
 
-    /// No terminal audio API: leaving synth null keeps tone() a no-op.
     pub fn tone(b: *Backend) void {
-        _ = b;
+        _ = b; // no terminal audio API
     }
 };
 
-const FrameData = struct { data: []const u8, compressed: bool };
+/// Dirty rect mapped to output pixels and snapped to the terminal cell grid.
+const Box = struct {
+    px0: u32, py0: u32, rw: u32, rh: u32,
 
-const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
+    fn compute(l: Layout, r: Rect) Box {
+        const cw = l.cell.w;
+        const ch = l.cell.h;
+        const px0 = (@as(u32, r.x) * l.out_w / W / cw) * cw;
+        const py0 = (@as(u32, r.y) * l.out_h / H / ch) * ch;
+        const px1 = ((@as(u32, r.x + r.w) * l.out_w + W - 1) / W + cw - 1) / cw * cw;
+        const py1 = ((@as(u32, r.y + r.h) * l.out_h + H - 1) / H + ch - 1) / ch * ch;
+        return .{
+            .px0 = px0, .py0 = py0,
+            .rw = @min(px1 - px0, l.out_w - px0),
+            .rh = @min(py1 - py0, l.out_h - py0),
+        };
+    }
+};
 
-/// Pixel-perfect nearest-neighbour upscale of just the dirty rectangle. The
-/// terminal would otherwise interpolate a scaled placement and blur pixels.
-fn nearestScale(b: *const Backend, fb_bytes: []const u8, px0: u32, py0: u32, rw: u32, rh: u32) []const u8 {
-    const l = b.layout;
+/// Pixel-perfect nearest-neighbour upscale of just the dirty rectangle.
+fn upscale(b: *Backend, fb_bytes: []const u8, box: Box) []const u8 {
+    const bufs = &b.buffers;
     const src: []const u32 = @ptrCast(@alignCast(fb_bytes));
-    if (l.out_w == W and l.out_h == H) {
-        // 1:1: copy the source rows directly into the scratch buffer.
-        for (0..rh) |y| {
-            const so = (py0 + y) * W + px0;
-            @memcpy(b.scaled[y * rw ..][0..rw], src[so..][0..rw]);
+    if (b.layout.out_w == W and b.layout.out_h == H) {
+        for (0..box.rh) |y| {
+            const so = (box.py0 + y) * W + box.px0;
+            @memcpy(bufs.scaled[y * box.rw ..][0..box.rw], src[so..][0..box.rw]);
         }
     } else {
-        // Table lookups instead of two integer divisions per output pixel.
-        for (0..rh) |y| {
-            const sy: usize = b.sy_map[py0 + y];
-            const row = b.scaled[y * rw ..][0..rw];
-            for (0..rw) |x| row[x] = src[sy * W + b.sx_map[px0 + x]];
+        for (0..box.rh) |y| {
+            const sy: usize = bufs.sy[box.py0 + y];
+            const row = bufs.scaled[y * box.rw ..][0..box.rw];
+            for (0..box.rw) |x| row[x] = src[sy * W + bufs.sx[box.px0 + x]];
         }
     }
-    return std.mem.sliceAsBytes(b.scaled[0 .. rw * rh]);
+    return std.mem.sliceAsBytes(bufs.scaled[0 .. box.rw * box.rh]);
 }
 
-fn compressFrame(b: *const Backend, src: []const u8) FrameData {
-    // shortcut: full-frame zlib is enough (~60 fps measured; static frames
-    // are skipped entirely); revisit dirty rows if a noisy cart is too slow.
-    var w: std.Io.Writer = .fixed(b.zbuf);
-    const c = std.compress.flate.Compress.init(&w, &history, .zlib, .{
-        .good = 3,
-        .nice = 4,
-        .lazy = 0,
-        .chain = 1,
-    }) catch return .{ .data = src, .compressed = false };
-    compressor = c;
-    compressor.writer.writeAll(src) catch return .{ .data = src, .compressed = false };
-    compressor.finish() catch return .{ .data = src, .compressed = false };
-    const out = b.zbuf[0..w.end];
-    // Incompressible frames are cheaper to send raw than as zlib+base64.
-    if (out.len >= src.len) return .{ .data = src, .compressed = false };
-    return .{ .data = out, .compressed = true };
+fn compress(b: *Backend, src: []const u8) FrameData {
+    const raw: FrameData = .{ .data = src, .compressed = false };
+    var w: std.Io.Writer = .fixed(b.buffers.zbuf);
+    compressor = std.compress.flate.Compress.init(&w, &history, .zlib, .{
+        .good = 3, .nice = 4, .lazy = 0, .chain = 1,
+    }) catch return raw;
+    compressor.writer.writeAll(src) catch return raw;
+    compressor.finish() catch return raw;
+    const out = b.buffers.zbuf[0..w.end];
+    return if (out.len < src.len) .{ .data = out, .compressed = true } else raw;
 }
-
 
 fn nowNs(io: std.Io) i96 {
     return std.Io.Timestamp.now(io, .awake).toNanoseconds();
 }
 
-test "kitty keyboard events map to cart buttons and commands" {
-    const testing = std.testing;
+// ---- tests ------------------------------------------------------------------
+
+test "keyboard events map to cart buttons and commands" {
+    const t = std.testing;
     var p = Parser.init(Layout.compute(80, 24, 10, 20));
-    p.feed("\x1b[1;1:1D"); // left press
-    try testing.expectEqual(@as(u8, 1), p.held);
-    try testing.expectEqual(@as(u8, 1), p.pressed);
-    p.feed("\x1b[122;1:1u"); // Z press
-    try testing.expectEqual(@as(u8, 0x11), p.held);
-    p.feed("\x1b[122;1:3u"); // Z release
-    try testing.expectEqual(@as(u8, 1), p.held);
-    p.feed("\x1b[114;5:1u"); // Ctrl+R
-    try testing.expect(p.reload);
-    p.feed("\x1b[27;1:1u"); // Escape
-    try testing.expect(p.quit);
-    p.quit = false;
-    p.feed("\x1b[99;5:1u"); // Ctrl+C
-    try testing.expect(p.quit);
-    p.quit = false;
-    p.feed("\x03"); // legacy Ctrl+C
-    try testing.expect(p.quit);
+    p.feed("\x1b[1;1:1D");
+    try t.expectEqual(@as(u8, 1), p.held);
+    try t.expectEqual(@as(u8, 1), p.pressed);
+    p.feed("\x1b[122;1:1u");
+    try t.expectEqual(@as(u8, 0x11), p.held);
+    p.feed("\x1b[122;1:3u");
+    try t.expectEqual(@as(u8, 1), p.held);
+    for ([_][]const u8{ "\x1b[114;5:1u", "\x1b[27;1:1u", "\x1b[99;5:1u", "\x03" }) |seq| p.feed(seq);
+    try t.expect(p.reload);
+    try t.expect(p.quit);
 }
 
 test "dirty rect is the bounding box of changed pixels" {
-    const testing = std.testing;
+    const t = std.testing;
     @memset(&prev_fb, 0);
     var fb: [W * H]u32 = @splat(0);
     fb[10 * W + 20] = 1;
     fb[12 * W + 30] = 2;
     const r = Backend.dirtyRect(std.mem.sliceAsBytes(&fb)).?;
-    try testing.expectEqual(@as(u32, 20), r.x);
-    try testing.expectEqual(@as(u32, 10), r.y);
-    try testing.expectEqual(@as(u32, 11), r.w);
-    try testing.expectEqual(@as(u32, 3), r.h);
-    try testing.expect(Backend.dirtyRect(std.mem.sliceAsBytes(&fb)) == null);
+    try t.expectEqual(@as(u32, 20), r.x);
+    try t.expectEqual(@as(u32, 10), r.y);
+    try t.expectEqual(@as(u32, 11), r.w);
+    try t.expectEqual(@as(u32, 3), r.h);
+    try t.expect(Backend.dirtyRect(std.mem.sliceAsBytes(&fb)) == null);
 }
 
 test "cell size reply uses CSI 6;h;wt" {
-    const testing = std.testing;
-    const cell = parseCellSize("\x1b[?62c\x1b[6;21;11t");
-    try testing.expectEqual(@as(u16, 11), cell.?.w);
-    try testing.expectEqual(@as(u16, 21), cell.?.h);
+    const cell = parseCellSize("\x1b[?62c\x1b[6;21;11t").?;
+    try std.testing.expectEqual(@as(u16, 11), cell.w);
+    try std.testing.expectEqual(@as(u16, 21), cell.h);
 }
 
 test "SGR mouse maps cells into the framebuffer" {
-    const testing = std.testing;
+    const t = std.testing;
     const l = Layout.compute(80, 24, 10, 20);
-    try testing.expectEqual(@as(u16, 80), l.place_cols);
-    try testing.expectEqual(@as(u16, 22), l.place_rows);
+    try t.expectEqual(@as(u16, 80), l.place_cols);
+    try t.expectEqual(@as(u16, 22), l.place_rows);
     var p = Parser.init(l);
     p.feed("\x1b[<0;2;2M");
-    try testing.expectEqual(@as(u8, 1), p.mouse);
-    try testing.expectEqual(@as(i32, 4), p.mouse_x);
-    try testing.expectEqual(@as(i32, 0), p.mouse_y);
+    try t.expectEqual(@as(u8, 1), p.mouse);
+    try t.expectEqual(@as(i32, 4), p.mouse_x);
+    try t.expectEqual(@as(i32, 0), p.mouse_y);
     p.feed("\x1b[<0;2;2m");
-    try testing.expectEqual(@as(u8, 0), p.mouse);
+    try t.expectEqual(@as(u8, 0), p.mouse);
 }
