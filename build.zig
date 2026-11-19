@@ -2,6 +2,7 @@ const std = @import("std");
 
 /// raylib's Linux display backend (mapped to GLFW's _GLFW_X11/_GLFW_WAYLAND).
 pub const LinuxDisplayBackend = enum { X11, Wayland, Both };
+pub const BackendKind = enum { raylib, kitty };
 
 // nex - Zig host for vex carts.
 //
@@ -39,6 +40,11 @@ pub fn build(b: *std.Build) void {
         "linux_display_backend",
         "raylib Linux display backend: X11 (default), Wayland, Both",
     ) orelse .X11;
+    const backend_kind = b.option(
+        BackendKind,
+        "backend",
+        "Platform backend: raylib (default) or kitty (terminal)",
+    ) orelse .raylib;
 
     // ---- example carts (no host dependencies) -----------------------------
     const carts_step = b.step("carts", "Build the example carts");
@@ -51,10 +57,6 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---- host -------------------------------------------------------------
-    const raylib_dep = b.lazyDependency("raylib", .{
-        .target = target,
-        .optimize = optimize,
-    }) orelse return; // not fetched yet: zig fetches lazy deps and reruns
     // Pass the mode down: wasm3's build.zig reads it with
     // standardOptimizeOption(.{}), which aborts on a bare --release.
     const wasm3_dep = b.lazyDependency("wasm3", .{
@@ -62,12 +64,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) orelse return;
 
-    const rl_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/raylib_c.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    rl_c.addIncludePath(raylib_dep.path("src"));
+    // Only the desktop backend compiles raylib (and its GL/X11/Wayland
+    // sources). The terminal backend needs just libc + wasm3.
+    var rl_mod: ?*std.Build.Module = null;
+    if (backend_kind == .raylib) {
+        const raylib_dep = b.lazyDependency("raylib", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse return; // not fetched yet: zig fetches lazy deps and reruns
+        const rl_c = b.addTranslateC(.{
+            .root_source_file = b.path("src/raylib_c.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        rl_c.addIncludePath(raylib_dep.path("src"));
+        rl_mod = rl_c.createModule();
+    }
+
     const m3_c = b.addTranslateC(.{
         .root_source_file = wasm3_dep.path("source/wasm3.h"),
         .target = target,
@@ -75,7 +88,8 @@ pub fn build(b: *std.Build) void {
     });
     m3_c.addIncludePath(wasm3_dep.path("source"));
 
-    const rl_mod = rl_c.createModule();
+    const options = b.addOptions();
+    options.addOption([]const u8, "backend", @tagName(backend_kind));
 
     const host_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -84,12 +98,19 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .strip = optimize != .debug,
         .imports = &.{
-            .{ .name = "rl", .module = rl_mod },
+            .{ .name = "build_options", .module = options.createModule() },
             .{ .name = "m3", .module = m3_c.createModule() },
         },
     });
+    if (rl_mod) |rl| host_mod.addImport("rl", rl);
     addWasm3(host_mod, wasm3_dep);
-    addRaylib(host_mod, raylib_dep, linux_display_backend);
+    if (rl_mod != null) {
+        const raylib_dep = b.lazyDependency("raylib", .{
+            .target = target,
+            .optimize = optimize,
+        }).?;
+        addRaylib(host_mod, raylib_dep, linux_display_backend);
+    }
 
     const exe = b.addExecutable(.{ .name = "nex", .root_module = host_mod });
     if (target.result.os.tag == .windows) exe.subsystem = .windows;
@@ -109,11 +130,12 @@ pub fn build(b: *std.Build) void {
     // The core files don't touch raylib, so tests never compile it. cart.zig
     // needs wasm3 for its bindings.
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/gfx.zig", "src/input.zig", "src/synth.zig" }) |path| {
+    for ([_][]const u8{ "src/gfx.zig", "src/input.zig", "src/synth.zig", "src/kitty_test.zig" }) |path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,
             .optimize = test_optimize,
+            .link_libc = true,
         }) });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
