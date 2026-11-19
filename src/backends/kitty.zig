@@ -30,10 +30,12 @@ var compressor: std.compress.flate.Compress = undefined;
 var detect_buf: [4096]u8 = undefined;
 var prev_fb: [W * H]u32 = @splat(0xffffffff);
 
-/// A full refresh every so often bounds the number of live placements (older
-/// ids are then deleted in one range). Dirty rects use fresh ids so they never
-/// remove an unrelated part of the screen.
-const refresh_frames = 120;
+/// Ghostty stores decoded RGBA and evicts oldest images past ~10 MB; an
+/// eviction leaves a hole. Keep live placements well under that budget, and
+/// refresh in one piece before it can happen. Dirty rects use fresh ids so
+/// they never remove an unrelated part of the screen.
+const storage_budget = 6 * 1024 * 1024;
+const max_live_images = 64;
 
 const Layout = struct {
     cols: u16,
@@ -358,6 +360,7 @@ pub const Backend = struct {
     next_ns: i96,
     next_id: u32 = 1,
     frames_sent: u32 = 0,
+    live_bytes: u64 = 0,
     scaled: []u32 = &.{},
     zbuf: []u8 = &.{},
     b64buf: []u8 = &.{},
@@ -506,8 +509,9 @@ pub const Backend = struct {
         const fb = b.cfg.console.gfx.bytes();
         if (dirtyRect(fb)) |rect| {
             const area = @as(u32, rect.w) * rect.h;
-            const full = b.frames_sent == 0 or b.frames_sent % refresh_frames == 0 or
-                area * 10 > @as(u32, W) * H * 9;
+            const bytes: u64 = @as(u64, area) * b.layout.out_w / W * b.layout.out_h / H * 4;
+            const full = b.frames_sent == 0 or b.frames_sent % max_live_images == 0 or
+                b.live_bytes + bytes > storage_budget or area * 10 > @as(u32, W) * H * 9;
             b.sendFrame(fb, if (full) .{ .x = 0, .y = 0, .w = W, .h = H } else rect, full);
             b.frames_sent += 1;
         }
@@ -581,6 +585,7 @@ pub const Backend = struct {
             b.out.print("\x1b_Ga=d,d=R,x=1,y={d},q=1\x1b\\", .{id - 1});
             b.out.flush();
         }
+        b.live_bytes = if (full) @as(u64, rw) * rh * 4 else b.live_bytes + @as(u64, rw) * rh * 4;
     }
 
     /// Same absolute-deadline pacing as the desktop backend, so cart ticks
