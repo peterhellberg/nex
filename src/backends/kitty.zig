@@ -3,7 +3,8 @@
 //!
 //! The cart's 320x180 RGBA framebuffer is nearest-neighbour upscaled in Zig to
 //! the exact pixel size of its cell rectangle, then zlib-compressed and sent
-//! as chunked `a=T` placements. Only changed rectangles are retransmitted.
+//! as chunked `a=T` placements. Unchanged frames are skipped; a new full-screen
+//! image is placed before the previous one is deleted, so there is no flicker.
 //! There is no terminal audio or gamepad API, so console.synth stays null.
 
 const std = @import("std");
@@ -22,14 +23,6 @@ const apc_end = "\x1b\\";
 const query = apc ++ "i=31,s=1,v=1,a=q,t=d,f=24;AAAA" ++ apc_end ++ "\x1b[c\x1b[16t";
 const enter_seq = "\x1b[?1049h\x1b[?25l\x1b[0m\x1b[2J\x1b[H\x1b[>3u\x1b[?1002h\x1b[?1006h";
 const leave_seq = "\x1b[<u\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l";
-/// Ghostty evicts oldest images past ~10 MB of decoded RGBA; a hole is left.
-const storage_budget = 6 * 1024 * 1024;
-const max_live_images = 64;
-/// Even if the framebuffer is unchanged, periodically re-send the whole frame:
-/// the terminal can drop a placement (quota, scrollback) and culling alone
-/// would never notice the hole.
-const repair_interval: i96 = 2 * std.time.ns_per_s;
-
 // Reused across frames; frame-sized scratch is allocated per terminal size.
 var history: [std.compress.flate.max_window_len]u8 = undefined;
 var compressor: std.compress.flate.Compress = undefined;
@@ -369,10 +362,10 @@ pub const Backend = struct {
     layout: Layout,
     buffers: Buffers = .{},
     next_ns: i96,
+    /// Two ids alternate: place the new full frame before deleting the old
+    /// one, so there is never a frame with no image on screen.
     next_id: u32 = 1,
-    frames_sent: u32 = 0,
-    live_bytes: u64 = 0,
-    next_repair_ns: i96,
+    prev_id: u32 = 0,
 
     pub fn init(cfg: backend.Config) !Backend {
         const now = nowNs(cfg.io);
@@ -386,7 +379,6 @@ pub const Backend = struct {
             .saved_termios = saved,
             .layout = Layout.compute(80, 24, cell_fallback.w, cell_fallback.h),
             .next_ns = now + tick_ns,
-            .next_repair_ns = now + repair_interval,
         };
         const cell = try self.detect();
         if (terminalSize()) |ws| self.layout = Layout.compute(ws.col, ws.row, cell.w, cell.h);
@@ -467,28 +459,12 @@ pub const Backend = struct {
         b.out.writeAll("\x1b[2J");
         b.out.writeAll(apc ++ "a=d,d=A,q=1" ++ apc_end);
         b.out.flush();
-        b.next_id = 1;
-        b.frames_sent = 0;
-        b.live_bytes = 0;
+        b.prev_id = 0;
     }
 
     pub fn present(b: *Backend) u32 {
         const fb = b.cfg.console.gfx.bytes();
-        const now = nowNs(b.cfg.io);
-        const repair = now >= b.next_repair_ns;
-        if (repair) b.next_repair_ns = now + repair_interval;
-        const actual = dirtyRect(fb);
-        if (actual != null or repair) {
-            const rect: Rect = actual orelse .{ .x = 0, .y = 0, .w = W, .h = H };
-            const box = Box.compute(b.layout, rect);
-            const bytes: u64 = @as(u64, box.rw) * box.rh * 4;
-            const full = repair or b.frames_sent == 0 or b.frames_sent % max_live_images == 0 or
-                b.live_bytes + bytes > storage_budget or
-                @as(u64, rect.w) * rect.h * 10 > @as(u64, W) * H * 9;
-            b.send(fb, box, full);
-            b.frames_sent += 1;
-            b.live_bytes = if (full) bytes else b.live_bytes + bytes;
-        }
+        if (dirtyRect(fb) != null) b.send(fb);
         return b.pace();
     }
 
@@ -513,17 +489,14 @@ pub const Backend = struct {
         return .{ .x = @intCast(x0), .y = @intCast(y0), .w = @intCast(x1 - x0 + 1), .h = @intCast(y1 - y0 + 1) };
     }
 
-    fn send(b: *Backend, fb: []const u8, box: Box, full: bool) void {
+    fn send(b: *Backend, fb: []const u8) void {
         const l = b.layout;
-        const src = upscale(b, fb, box);
+        const src = upscale(b, fb);
         const frame = compress(b, src);
         const encoded = std.base64.standard.Encoder.encode(b.buffers.b64, frame.data);
-        const col = l.off_col + @as(u16, @intCast(box.px0 / l.cell.w));
-        const row = l.off_row + @as(u16, @intCast(box.py0 / l.cell.h));
-        b.out.print("\x1b[{d};{d}H", .{ row, col });
+        b.out.print("\x1b[{d};{d}H", .{ l.off_row, l.off_col });
 
         const id = b.next_id;
-        b.next_id += 1;
         var pos: usize = 0;
         var index: usize = 0;
         while (pos < encoded.len) : (index += 1) {
@@ -533,7 +506,7 @@ pub const Backend = struct {
                 // No c/r: the image is already the exact pixel size of the
                 // cell rectangle, so the terminal displays it 1:1 (no blur).
                 b.out.print(apc ++ "a=T,i={d},f=32,s={d},v={d},q=1,C=1,m={d}{s};", .{
-                    id, box.rw, box.rh, @intFromBool(more), if (frame.compressed) ",o=z" else "",
+                    id, l.out_w, l.out_h, @intFromBool(more), if (frame.compressed) ",o=z" else "",
                 });
             } else {
                 b.out.print(apc ++ "q=1,m={d};", .{@intFromBool(more)});
@@ -543,12 +516,13 @@ pub const Backend = struct {
             b.out.flush();
             pos = end;
         }
-        // Delete only after the new frame is on screen, or there is a
-        // black frame between delete and placement.
-        if (full and id > 1) {
-            b.out.print(apc ++ "a=d,d=R,x=1,y={d},q=1" ++ apc_end, .{id - 1});
+        // New frame is on screen; only now drop the previous one.
+        if (b.prev_id != 0) {
+            b.out.print(apc ++ "a=d,d=I,i={d},q=1" ++ apc_end, .{b.prev_id});
             b.out.flush();
         }
+        b.prev_id = id;
+        b.next_id += 1;
     }
 
     /// Absolute-deadline pacing: 60 cart ticks even if a frame is dropped.
@@ -572,42 +546,23 @@ pub const Backend = struct {
     }
 };
 
-/// Dirty rect mapped to output pixels and snapped to the terminal cell grid.
-const Box = struct {
-    px0: u32, py0: u32, rw: u32, rh: u32,
-
-    fn compute(l: Layout, r: Rect) Box {
-        const cw = l.cell.w;
-        const ch = l.cell.h;
-        const px0 = (@as(u32, r.x) * l.out_w / W / cw) * cw;
-        const py0 = (@as(u32, r.y) * l.out_h / H / ch) * ch;
-        const px1 = ((@as(u32, r.x + r.w) * l.out_w + W - 1) / W + cw - 1) / cw * cw;
-        const py1 = ((@as(u32, r.y + r.h) * l.out_h + H - 1) / H + ch - 1) / ch * ch;
-        return .{
-            .px0 = px0, .py0 = py0,
-            .rw = @min(px1 - px0, l.out_w - px0),
-            .rh = @min(py1 - py0, l.out_h - py0),
-        };
-    }
-};
-
-/// Pixel-perfect nearest-neighbour upscale of just the dirty rectangle.
-fn upscale(b: *Backend, fb_bytes: []const u8, box: Box) []const u8 {
+/// Pixel-perfect nearest-neighbour upscale of the whole frame. The terminal
+/// would otherwise interpolate a scaled placement and blur every pixel.
+fn upscale(b: *Backend, fb_bytes: []const u8) []const u8 {
     const bufs = &b.buffers;
     const src: []const u32 = @ptrCast(@alignCast(fb_bytes));
-    if (b.layout.out_w == W and b.layout.out_h == H) {
-        for (0..box.rh) |y| {
-            const so = (box.py0 + y) * W + box.px0;
-            @memcpy(bufs.scaled[y * box.rw ..][0..box.rw], src[so..][0..box.rw]);
-        }
+    const ow = b.layout.out_w;
+    const oh = b.layout.out_h;
+    if (ow == W and oh == H) {
+        @memcpy(bufs.scaled, src);
     } else {
-        for (0..box.rh) |y| {
-            const sy: usize = bufs.sy[box.py0 + y];
-            const row = bufs.scaled[y * box.rw ..][0..box.rw];
-            for (0..box.rw) |x| row[x] = src[sy * W + bufs.sx[box.px0 + x]];
+        for (0..oh) |y| {
+            const sy: usize = bufs.sy[y];
+            const row = bufs.scaled[y * ow ..][0..ow];
+            for (0..ow) |x| row[x] = src[sy * W + bufs.sx[x]];
         }
     }
-    return std.mem.sliceAsBytes(bufs.scaled[0 .. box.rw * box.rh]);
+    return std.mem.sliceAsBytes(bufs.scaled);
 }
 
 fn compress(b: *Backend, src: []const u8) FrameData {
