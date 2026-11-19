@@ -392,7 +392,7 @@ pub const Backend = struct {
     }
 
     pub fn deinit(b: *Backend) void {
-        b.out.writeAll("\x1b<2u"); // pop keyboard flags
+        b.out.writeAll("\x1b<u"); // pop keyboard flags
         b.out.writeAll("\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         b.out.flush();
         posix.tcsetattr(0, .NOW, b.saved_termios) catch {};
