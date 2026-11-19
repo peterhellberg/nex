@@ -19,6 +19,10 @@
 //!   Super+R      reload the cart from disk
 //!   Escape       quit
 //!
+//! The kitty backend (zig build -Dbackend=kitty) has no window or audio:
+//! Ctrl+R reloads, Escape quits, and the six cart buttons are arrow keys,
+//! Z and X.
+//!
 //! Platform code lives in src/backends; the cart-facing modules stay
 //! platform-independent.
 

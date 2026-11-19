@@ -9,6 +9,7 @@ pub const BackendKind = enum { raylib, kitty };
 //   zig build            build ./zig-out/bin/nex and the example carts
 //   zig build run        run the Zig example cart
 //   zig build run-c      run the C example cart
+//   zig build -Dbackend=kitty run   run in a Kitty/Ghostty terminal
 //   zig build test       unit tests (gfx, synth, input, wasm bindings)
 //   zig build carts      just the example carts (zig-out/bin/*.wasm)
 //
