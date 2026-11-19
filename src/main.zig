@@ -265,6 +265,7 @@ fn runWindow(gpa: std.mem.Allocator, io: std.Io, cart: *Cart, opts: Options, ini
         .console = &console,
         .synth = &synth,
         .io = io,
+        .gpa = gpa,
         .scale = opts.scale,
     });
     defer backend.deinit();

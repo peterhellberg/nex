@@ -13,6 +13,7 @@ pub const Config = struct {
     /// Backends without an audio device simply leave console.synth null.
     synth: *Synth,
     io: std.Io,
+    gpa: std.mem.Allocator,
     scale: i32,
 };
 
