@@ -455,7 +455,14 @@ pub const Backend = struct {
         b.parser.layout = fresh;
         try b.buffers.alloc(b.cfg.gpa, fresh);
         @memset(&prev_fb, 0xffffffff); // force a full redraw on resize
+        // Old placements are at the previous grid's coordinates; without
+        // deleting them, stale pixels linger at the edges after a resize.
         b.out.writeAll("\x1b[2J");
+        b.out.writeAll(apc ++ "a=d,d=A,q=1" ++ apc_end);
+        b.out.flush();
+        b.next_id = 1;
+        b.frames_sent = 0;
+        b.live_bytes = 0;
     }
 
     pub fn present(b: *Backend) u32 {
