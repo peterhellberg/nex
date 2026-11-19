@@ -1,6 +1,7 @@
 //! nex - a Zig host for vex carts.
 //!
 //!   usage: nex [-s scale] [-w] [-n frames] [-t] [--dump file] <cart.wasm>
+//!   (the terminal build installs the same program as `kex`)
 //!
 //!   -s, --scale N    initial window scale (1..20, default 3)
 //!   -w, --watch      reload the cart whenever its file changes
@@ -58,7 +59,7 @@ const Options = struct {
 };
 
 fn usage() void {
-    std.debug.print("usage: nex [-s scale] [-w] [-n frames] [-t] [--dump file] <cart.wasm>\n", .{});
+    std.debug.print("usage: {s} [-s scale] [-w] [-n frames] [-t] [--dump file] <cart.wasm>\n", .{if (std.mem.eql(u8, build_options.backend, "kitty")) "kex" else "nex"});
 }
 
 pub fn main(init: std.process.Init) !u8 {
