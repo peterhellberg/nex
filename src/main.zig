@@ -27,7 +27,11 @@ const gfx = @import("gfx.zig");
 const Console = @import("Console.zig");
 const Synth = @import("synth.zig").Synth;
 const Cart = @import("cart.zig").Cart;
-const Backend = @import("backends/raylib.zig").Backend;
+const build_options = @import("build_options");
+const Backend = if (std.mem.eql(u8, build_options.backend, "kitty"))
+    @import("backends/kitty.zig").Backend
+else
+    @import("backends/raylib.zig").Backend;
 
 const sample_rate = 48000;
 const max_cart_size = 16 << 20;
@@ -255,6 +259,7 @@ fn runWindow(gpa: std.mem.Allocator, io: std.Io, cart: *Cart, opts: Options, ini
     var backend = try Backend.init(.{
         .console = &console,
         .synth = &synth,
+        .io = io,
         .scale = opts.scale,
     });
     defer backend.deinit();
