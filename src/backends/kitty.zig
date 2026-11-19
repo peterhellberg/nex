@@ -366,7 +366,7 @@ pub const Backend = struct {
         self.out.writeAll("\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c\x1b[16t");
         self.out.flush();
         var len: usize = 0;
-        for (0..30) |_| {
+        for (0..100) |_| {
             if (!inputReady(10)) continue;
             if (len < detect_buf.len) len += sysRead(0, detect_buf[len..]);
             if (std.mem.indexOf(u8, detect_buf[0..len], "\x1b[c") != null and
