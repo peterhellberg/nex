@@ -75,6 +75,8 @@ pub fn build(b: *std.Build) void {
     });
     m3_c.addIncludePath(wasm3_dep.path("source"));
 
+    const rl_mod = rl_c.createModule();
+
     const host_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -82,7 +84,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .strip = optimize != .debug,
         .imports = &.{
-            .{ .name = "rl", .module = rl_c.createModule() },
+            .{ .name = "rl", .module = rl_mod },
             .{ .name = "m3", .module = m3_c.createModule() },
         },
     });
