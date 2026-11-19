@@ -17,6 +17,8 @@ const W = gfx.W;
 const H = gfx.H;
 const tick_ns: i96 = std.time.ns_per_s / 60;
 const chunk_len = 4096; // base64 bytes per APC chunk, multiple of four
+/// Cap the nearest-neighbour upscale at 2x the 320x180 framebuffer (640x360).
+const max_scale: f32 = 2;
 const cell_fallback: Cell = .{ .w = 10, .h = 20 };
 const apc = "\x1b_G";
 const apc_end = "\x1b\\";
@@ -30,7 +32,23 @@ var detect_buf: [4096]u8 = undefined;
 var prev_fb: [W * H]u32 = @splat(0xffffffff);
 
 const Cell = struct { w: u16, h: u16 };
-const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
+const Rect = struct {
+    x: u32, y: u32, w: u32, h: u32,
+
+    fn area(r: Rect) u64 {
+        return @as(u64, r.w) * r.h;
+    }
+
+    fn merge(a: Rect, b: Rect) Rect {
+        const x = @min(a.x, b.x);
+        const y = @min(a.y, b.y);
+        return .{
+            .x = x, .y = y,
+            .w = @max(a.x + a.w, b.x + b.w) - x,
+            .h = @max(a.y + a.h, b.y + b.h) - y,
+        };
+    }
+};
 const FrameData = struct { data: []const u8, compressed: bool };
 
 const Layout = struct {
@@ -47,7 +65,7 @@ const Layout = struct {
     fn compute(cols: u16, rows: u16, cw: u16, ch: u16) Layout {
         const c: u16 = @max(cols, 1);
         const r: u16 = @max(rows, 1);
-        const s = @min(@as(f32, @floatFromInt(c * cw)) / W, @as(f32, @floatFromInt(r * ch)) / H);
+        const s = @min(max_scale, @as(f32, @floatFromInt(c * cw)) / W, @as(f32, @floatFromInt(r * ch)) / H);
         const pc = cells(@as(f32, W) * s / cw, c);
         const pr = cells(@as(f32, H) * s / ch, r);
         return .{
@@ -362,10 +380,16 @@ pub const Backend = struct {
     layout: Layout,
     buffers: Buffers = .{},
     next_ns: i96,
-    /// Two ids alternate: place the new full frame before deleting the old
-    /// one, so there is never a frame with no image on screen.
     next_id: u32 = 1,
-    prev_id: u32 = 0,
+    /// Full-screen fallback image. Partial updates always sit on top of it;
+    /// it is replaced only by a new full frame, never by a small rectangle.
+    base_id: u32 = 0,
+    /// Last partial placement. The next one covers it, so it can be deleted.
+    partial_id: u32 = 0,
+    /// Union of all dirty rects since the last full frame: only ever grows.
+    dirty: ?Rect = null,
+    /// Bound live images so the terminal never evicts the base frame.
+    partial_count: u32 = 0,
 
     pub fn init(cfg: backend.Config) !Backend {
         const now = nowNs(cfg.io);
@@ -459,12 +483,22 @@ pub const Backend = struct {
         b.out.writeAll("\x1b[2J");
         b.out.writeAll(apc ++ "a=d,d=A,q=1" ++ apc_end);
         b.out.flush();
-        b.prev_id = 0;
+        b.base_id = 0;
+        b.partial_id = 0;
+        b.partial_count = 0;
+        b.dirty = null;
     }
 
     pub fn present(b: *Backend) u32 {
         const fb = b.cfg.console.gfx.bytes();
-        if (dirtyRect(fb) != null) b.send(fb);
+        if (dirtyRect(fb)) |changed| {
+            const grown = if (b.dirty) |old| old.merge(changed) else changed;
+            const full = b.base_id == 0 or b.partial_count >= 4 or
+                grown.area() * 10 > @as(u64, W) * H * 9;
+            const rect: Rect = if (full) .{ .x = 0, .y = 0, .w = W, .h = H } else grown;
+            b.send(fb, rect, full);
+            b.dirty = if (full) null else grown;
+        }
         return b.pace();
     }
 
@@ -489,12 +523,15 @@ pub const Backend = struct {
         return .{ .x = @intCast(x0), .y = @intCast(y0), .w = @intCast(x1 - x0 + 1), .h = @intCast(y1 - y0 + 1) };
     }
 
-    fn send(b: *Backend, fb: []const u8) void {
+    fn send(b: *Backend, fb: []const u8, rect: Rect, full: bool) void {
         const l = b.layout;
-        const src = upscale(b, fb);
+        const box = Box.compute(l, rect);
+        const src = upscale(b, fb, box);
         const frame = compress(b, src);
         const encoded = std.base64.standard.Encoder.encode(b.buffers.b64, frame.data);
-        b.out.print("\x1b[{d};{d}H", .{ l.off_row, l.off_col });
+        const col = l.off_col + @as(u16, @intCast(box.px0 / l.cell.w));
+        const row = l.off_row + @as(u16, @intCast(box.py0 / l.cell.h));
+        b.out.print("\x1b[{d};{d}H", .{ row, col });
 
         const id = b.next_id;
         var pos: usize = 0;
@@ -506,7 +543,7 @@ pub const Backend = struct {
                 // No c/r: the image is already the exact pixel size of the
                 // cell rectangle, so the terminal displays it 1:1 (no blur).
                 b.out.print(apc ++ "a=T,i={d},f=32,s={d},v={d},q=1,C=1,m={d}{s};", .{
-                    id, l.out_w, l.out_h, @intFromBool(more), if (frame.compressed) ",o=z" else "",
+                    id, box.rw, box.rh, @intFromBool(more), if (frame.compressed) ",o=z" else "",
                 });
             } else {
                 b.out.print(apc ++ "q=1,m={d};", .{@intFromBool(more)});
@@ -516,12 +553,23 @@ pub const Backend = struct {
             b.out.flush();
             pos = end;
         }
-        // New frame is on screen; only now drop the previous one.
-        if (b.prev_id != 0) {
-            b.out.print(apc ++ "a=d,d=I,i={d},q=1" ++ apc_end, .{b.prev_id});
-            b.out.flush();
+        // Delete only images fully covered by the new placement: the last
+        // partial (union only grows), and the old base on a full refresh.
+        if (!full and b.partial_id != 0) {
+            b.out.print(apc ++ "a=d,d=I,i={d},q=1" ++ apc_end, .{b.partial_id});
         }
-        b.prev_id = id;
+        if (full and b.base_id != 0) {
+            b.out.print(apc ++ "a=d,d=I,i={d},q=1" ++ apc_end, .{b.base_id});
+        }
+        b.out.flush();
+        if (full) {
+            b.base_id = id;
+            b.partial_id = 0;
+            b.partial_count = 0;
+        } else {
+            b.partial_id = id;
+            b.partial_count += 1;
+        }
         b.next_id += 1;
     }
 
@@ -546,23 +594,43 @@ pub const Backend = struct {
     }
 };
 
-/// Pixel-perfect nearest-neighbour upscale of the whole frame. The terminal
-/// would otherwise interpolate a scaled placement and blur every pixel.
-fn upscale(b: *Backend, fb_bytes: []const u8) []const u8 {
+/// Dirty rectangle snapped to the terminal's cell grid. The live placement
+/// always grows, so a new one covers the old before it is deleted.
+const Box = struct {
+    px0: u32, py0: u32, rw: u32, rh: u32,
+
+    fn compute(l: Layout, r: Rect) Box {
+        const cw = l.cell.w;
+        const ch = l.cell.h;
+        const px0 = (@as(u32, r.x) * l.out_w / W / cw) * cw;
+        const py0 = (@as(u32, r.y) * l.out_h / H / ch) * ch;
+        const px1 = ((@as(u32, r.x + r.w) * l.out_w + W - 1) / W + cw - 1) / cw * cw;
+        const py1 = ((@as(u32, r.y + r.h) * l.out_h + H - 1) / H + ch - 1) / ch * ch;
+        return .{
+            .px0 = px0, .py0 = py0,
+            .rw = @min(px1 - px0, l.out_w - px0),
+            .rh = @min(py1 - py0, l.out_h - py0),
+        };
+    }
+};
+
+/// Pixel-perfect nearest-neighbour upscale of just the dirty rectangle.
+fn upscale(b: *Backend, fb_bytes: []const u8, box: Box) []const u8 {
     const bufs = &b.buffers;
     const src: []const u32 = @ptrCast(@alignCast(fb_bytes));
-    const ow = b.layout.out_w;
-    const oh = b.layout.out_h;
-    if (ow == W and oh == H) {
-        @memcpy(bufs.scaled, src);
+    if (b.layout.out_w == W and b.layout.out_h == H) {
+        for (0..box.rh) |y| {
+            const so = (box.py0 + y) * W + box.px0;
+            @memcpy(bufs.scaled[y * box.rw ..][0..box.rw], src[so..][0..box.rw]);
+        }
     } else {
-        for (0..oh) |y| {
-            const sy: usize = bufs.sy[y];
-            const row = bufs.scaled[y * ow ..][0..ow];
-            for (0..ow) |x| row[x] = src[sy * W + bufs.sx[x]];
+        for (0..box.rh) |y| {
+            const sy: usize = bufs.sy[box.py0 + y];
+            const row = bufs.scaled[y * box.rw ..][0..box.rw];
+            for (0..box.rw) |x| row[x] = src[sy * W + bufs.sx[box.px0 + x]];
         }
     }
-    return std.mem.sliceAsBytes(bufs.scaled);
+    return std.mem.sliceAsBytes(bufs.scaled[0 .. box.rw * box.rh]);
 }
 
 fn compress(b: *Backend, src: []const u8) FrameData {
@@ -621,13 +689,15 @@ test "cell size reply uses CSI 6;h;wt" {
 test "SGR mouse maps cells into the framebuffer" {
     const t = std.testing;
     const l = Layout.compute(80, 24, 10, 20);
-    try t.expectEqual(@as(u16, 80), l.place_cols);
-    try t.expectEqual(@as(u16, 22), l.place_rows);
+    try t.expectEqual(@as(u16, 64), l.place_cols); // capped at 2x native
+    try t.expectEqual(@as(u16, 18), l.place_rows);
+    try t.expectEqual(@as(u32, 640), l.out_w);
+    try t.expectEqual(@as(u32, 360), l.out_h);
     var p = Parser.init(l);
-    p.feed("\x1b[<0;2;2M");
+    p.feed("\x1b[<0;10;5M");
     try t.expectEqual(@as(u8, 1), p.mouse);
-    try t.expectEqual(@as(i32, 4), p.mouse_x);
-    try t.expectEqual(@as(i32, 0), p.mouse_y);
-    p.feed("\x1b[<0;2;2m");
+    try t.expectEqual(@as(i32, 5), p.mouse_x);
+    try t.expectEqual(@as(i32, 10), p.mouse_y);
+    p.feed("\x1b[<0;10;5m");
     try t.expectEqual(@as(u8, 0), p.mouse);
 }
