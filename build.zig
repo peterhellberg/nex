@@ -74,7 +74,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }) orelse return; // not fetched yet: zig fetches lazy deps and reruns
         const rl_c = b.addTranslateC(.{
-            .root_source_file = b.path("src/raylib_c.h"),
+            .root_source_file = b.path("src/backends/raylib_c.h"),
             .target = target,
             .optimize = optimize,
         });
