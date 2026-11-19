@@ -156,10 +156,14 @@ fn inputReady(timeout_ms: i32) bool {
 }
 
 fn terminalSize() ?posix.winsize {
-    if (builtin.os.tag != .linux) return null;
+    // TIOCGWINSZ is the one ioctl we need; its value differs per OS.
+    const request: c_int = switch (builtin.os.tag) {
+        .linux => 0x5413,
+        .macos, .ios, .tvos => 0x40087468,
+        else => return null,
+    };
     var ws: posix.winsize = undefined;
-    const rc = std.os.linux.ioctl(0, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws));
-    return if (posix.errno(rc) == .SUCCESS) ws else null;
+    return if (std.c.ioctl(0, request, &ws) == 0) ws else null;
 }
 
 /// XTWINOPS answers CSI 16t with CSI 6;<height>;<width>t (Ghostty, VTE).
@@ -366,7 +370,6 @@ pub const Backend = struct {
     live_bytes: u64 = 0,
 
     pub fn init(cfg: backend.Config) !Backend {
-        if (builtin.os.tag != .linux) @compileError("kitty backend requires Linux");
         const saved = try posix.tcgetattr(0);
         try setRawMode(saved);
         errdefer posix.tcsetattr(0, .NOW, saved) catch {};
