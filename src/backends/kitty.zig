@@ -361,6 +361,9 @@ pub const Backend = struct {
     scaled: []u32 = &.{},
     zbuf: []u8 = &.{},
     b64buf: []u8 = &.{},
+    /// Precomputed nearest-neighbour source coordinates (one per output row/col).
+    sx_map: []u16 = &.{},
+    sy_map: []u16 = &.{},
 
     pub fn init(cfg: backend.Config) !Backend {
         if (builtin.os.tag != .linux) @compileError("kitty backend requires Linux");
@@ -431,18 +434,30 @@ pub const Backend = struct {
         const zbuf = try b.cfg.gpa.alloc(u8, zlen);
         errdefer b.cfg.gpa.free(zbuf);
         const b64buf = try b.cfg.gpa.alloc(u8, (zlen * 4 + 2) / 3 + 4);
+        const sx = try b.cfg.gpa.alloc(u16, b.layout.out_w);
+        errdefer b.cfg.gpa.free(sx);
+        const sy = try b.cfg.gpa.alloc(u16, b.layout.out_h);
+        errdefer b.cfg.gpa.free(sy);
+        for (sx, 0..) |*slot, x| slot.* = @intCast(@min(x * W / b.layout.out_w, W - 1));
+        for (sy, 0..) |*slot, y| slot.* = @intCast(@min(y * H / b.layout.out_h, H - 1));
         b.cfg.gpa.free(b.scaled);
         b.cfg.gpa.free(b.zbuf);
         b.cfg.gpa.free(b.b64buf);
+        b.cfg.gpa.free(b.sx_map);
+        b.cfg.gpa.free(b.sy_map);
         b.scaled = scaled;
         b.zbuf = zbuf;
         b.b64buf = b64buf;
+        b.sx_map = sx;
+        b.sy_map = sy;
     }
 
     pub fn deinit(b: *Backend) void {
         b.cfg.gpa.free(b.scaled);
         b.cfg.gpa.free(b.zbuf);
         b.cfg.gpa.free(b.b64buf);
+        b.cfg.gpa.free(b.sx_map);
+        b.cfg.gpa.free(b.sy_map);
         b.out.writeAll("\x1b[<u"); // pop keyboard flags
         b.out.writeAll("\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
         b.out.flush();
@@ -492,7 +507,7 @@ pub const Backend = struct {
         if (dirtyRect(fb)) |rect| {
             const area = @as(u32, rect.w) * rect.h;
             const full = b.frames_sent == 0 or b.frames_sent % refresh_frames == 0 or
-                area * 4 > @as(u32, W) * H;
+                area * 10 > @as(u32, W) * H * 9;
             b.sendFrame(fb, if (full) .{ .x = 0, .y = 0, .w = W, .h = H } else rect, full);
             b.frames_sent += 1;
         }
@@ -532,7 +547,7 @@ pub const Backend = struct {
         const rw: u32 = @min(px1 - px0, l.out_w - px0);
         const rh: u32 = @min(py1 - py0, l.out_h - py0);
 
-        const src = nearestScale(b, fb_bytes, dirty, px0, py0, rw, rh);
+        const src = nearestScale(b, fb_bytes, px0, py0, rw, rh);
         const frame = compressFrame(b, src);
         const encoded = std.base64.standard.Encoder.encode(b.b64buf, frame.data);
 
@@ -598,25 +613,21 @@ const Rect = struct { x: u32, y: u32, w: u32, h: u32 };
 
 /// Pixel-perfect nearest-neighbour upscale of just the dirty rectangle. The
 /// terminal would otherwise interpolate a scaled placement and blur pixels.
-fn nearestScale(b: *const Backend, fb_bytes: []const u8, dirty: Rect, px0: u32, py0: u32, rw: u32, rh: u32) []const u8 {
+fn nearestScale(b: *const Backend, fb_bytes: []const u8, px0: u32, py0: u32, rw: u32, rh: u32) []const u8 {
     const l = b.layout;
+    const src: []const u32 = @ptrCast(@alignCast(fb_bytes));
     if (l.out_w == W and l.out_h == H) {
         // 1:1: copy the source rows directly into the scratch buffer.
-        const src: []const u32 = @ptrCast(@alignCast(fb_bytes));
         for (0..rh) |y| {
-            const sy = dirty.y + py0 + y;
-            const so = sy * W + dirty.x + px0;
+            const so = (py0 + y) * W + px0;
             @memcpy(b.scaled[y * rw ..][0..rw], src[so..][0..rw]);
         }
     } else {
-        const src: []const u32 = @ptrCast(@alignCast(fb_bytes));
+        // Table lookups instead of two integer divisions per output pixel.
         for (0..rh) |y| {
-            const sy: usize = @intCast(@min((py0 + y) * H / l.out_h, H - 1));
+            const sy: usize = b.sy_map[py0 + y];
             const row = b.scaled[y * rw ..][0..rw];
-            for (0..rw) |x| {
-                const sx: usize = @intCast(@min((px0 + x) * W / l.out_w, W - 1));
-                row[x] = src[sy * W + sx];
-            }
+            for (0..rw) |x| row[x] = src[sy * W + b.sx_map[px0 + x]];
         }
     }
     return std.mem.sliceAsBytes(b.scaled[0 .. rw * rh]);
@@ -627,10 +638,10 @@ fn compressFrame(b: *const Backend, src: []const u8) FrameData {
     // are skipped entirely); revisit dirty rows if a noisy cart is too slow.
     var w: std.Io.Writer = .fixed(b.zbuf);
     const c = std.compress.flate.Compress.init(&w, &history, .zlib, .{
-        .good = 4,
-        .nice = 8,
+        .good = 3,
+        .nice = 4,
         .lazy = 0,
-        .chain = 4,
+        .chain = 1,
     }) catch return .{ .data = src, .compressed = false };
     compressor = c;
     compressor.writer.writeAll(src) catch return .{ .data = src, .compressed = false };
