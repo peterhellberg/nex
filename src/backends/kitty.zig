@@ -25,6 +25,10 @@ const leave_seq = "\x1b[<u\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l";
 /// Ghostty evicts oldest images past ~10 MB of decoded RGBA; a hole is left.
 const storage_budget = 6 * 1024 * 1024;
 const max_live_images = 64;
+/// Even if the framebuffer is unchanged, periodically re-send the whole frame:
+/// the terminal can drop a placement (quota, scrollback) and culling alone
+/// would never notice the hole.
+const repair_interval: i96 = 2 * std.time.ns_per_s;
 
 // Reused across frames; frame-sized scratch is allocated per terminal size.
 var history: [std.compress.flate.max_window_len]u8 = undefined;
@@ -368,8 +372,10 @@ pub const Backend = struct {
     next_id: u32 = 1,
     frames_sent: u32 = 0,
     live_bytes: u64 = 0,
+    next_repair_ns: i96,
 
     pub fn init(cfg: backend.Config) !Backend {
+        const now = nowNs(cfg.io);
         const saved = try posix.tcgetattr(0);
         try setRawMode(saved);
         errdefer posix.tcsetattr(0, .NOW, saved) catch {};
@@ -379,7 +385,8 @@ pub const Backend = struct {
             .parser = undefined,
             .saved_termios = saved,
             .layout = Layout.compute(80, 24, cell_fallback.w, cell_fallback.h),
-            .next_ns = std.Io.Timestamp.now(cfg.io, .awake).toNanoseconds() + tick_ns,
+            .next_ns = now + tick_ns,
+            .next_repair_ns = now + repair_interval,
         };
         const cell = try self.detect();
         if (terminalSize()) |ws| self.layout = Layout.compute(ws.col, ws.row, cell.w, cell.h);
@@ -467,10 +474,15 @@ pub const Backend = struct {
 
     pub fn present(b: *Backend) u32 {
         const fb = b.cfg.console.gfx.bytes();
-        if (dirtyRect(fb)) |rect| {
+        const now = nowNs(b.cfg.io);
+        const repair = now >= b.next_repair_ns;
+        if (repair) b.next_repair_ns = now + repair_interval;
+        const actual = dirtyRect(fb);
+        if (actual != null or repair) {
+            const rect: Rect = actual orelse .{ .x = 0, .y = 0, .w = W, .h = H };
             const box = Box.compute(b.layout, rect);
             const bytes: u64 = @as(u64, box.rw) * box.rh * 4;
-            const full = b.frames_sent == 0 or b.frames_sent % max_live_images == 0 or
+            const full = repair or b.frames_sent == 0 or b.frames_sent % max_live_images == 0 or
                 b.live_bytes + bytes > storage_budget or
                 @as(u64, rect.w) * rect.h * 10 > @as(u64, W) * H * 9;
             b.send(fb, box, full);
