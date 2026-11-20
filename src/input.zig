@@ -12,8 +12,10 @@ pub const Input = struct {
     /// Presses latched since the last tick. A 144 Hz frame often runs zero
     /// ticks, so presses seen by the platform are latched until consumed.
     pressed: u8 = 0,
-    mouse_x: i32 = 0,
-    mouse_y: i32 = 0,
+    // Headless runs have no backend to set the pointer; use the screen centre
+    // (vex.WIDTH/2, vex.HEIGHT/2) to match the C host's default.
+    mouse_x: i32 = 160,
+    mouse_y: i32 = 90,
     /// Bit i set while mouse button i (0 left, 1 right, 2 middle) is held.
     mouse: u8 = 0,
 
