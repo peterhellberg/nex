@@ -2,10 +2,13 @@
 //! mouse input. Pure Zig plus POSIX syscalls; no terminal library.
 //!
 //! The cart's 320x180 RGBA framebuffer is nearest-neighbour upscaled in Zig to
-//! the exact pixel size of its cell rectangle, then zlib-compressed and sent
-//! as chunked `a=T` placements. Unchanged frames are skipped; a new full-screen
-//! image is placed before the previous one is deleted, so there is no flicker.
-//! There is no terminal audio or gamepad API, so console.synth stays null.
+//! the exact pixel size of its cell rectangle and stripped down to RGB (the
+//! framebuffer is always opaque). When running locally, frames are written to a
+//! POSIX shared-memory object and a single short `t=s` placement is sent;
+//! otherwise the RGB data is zlib-compressed and sent as chunked `t=d`
+//! placements. Unchanged frames are skipped; a new full-screen image is placed
+//! before the previous one is deleted, so there is no flicker. There is no
+//! terminal audio or gamepad API, so console.synth stays null.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -23,6 +26,9 @@ const cell_fallback: Cell = .{ .w = 10, .h = 20 };
 const apc = "\x1b_G";
 const apc_end = "\x1b\\";
 const query = apc ++ "i=31,s=1,v=1,a=q,t=d,f=24;AAAA" ++ apc_end ++ "\x1b[c\x1b[16t";
+/// Query id for the shared-memory support probe. High to avoid colliding with
+/// the image ids used for actual placements.
+const shm_probe_id: u32 = 0xfffffffe;
 const enter_alt = "\x1b[?1049h";
 const leave_alt = "\x1b[?1049l";
 const unsupported_msg = "nex: terminal does not support the kitty graphics protocol well enough\r\n";
@@ -94,24 +100,25 @@ const Layout = struct {
 };
 
 const Buffers = struct {
-    scaled: []u32 = &.{},
+    /// Upscaled RGB triplets (3 bytes per pixel), ready to transmit.
+    rgb: []u8 = &.{},
     zbuf: []u8 = &.{},
     b64: []u8 = &.{},
     sx: []u16 = &.{},
     sy: []u16 = &.{},
 
     fn deinit(b: *Buffers, gpa: std.mem.Allocator) void {
-        inline for (.{ "scaled", "zbuf", "b64", "sx", "sy" }) |name| gpa.free(@field(b, name));
+        inline for (.{ "rgb", "zbuf", "b64", "sx", "sy" }) |name| gpa.free(@field(b, name));
         b.* = .{};
     }
 
     fn alloc(b: *Buffers, gpa: std.mem.Allocator, l: Layout) !void {
         const pixels = @as(usize, l.out_w) * l.out_h;
-        const zlen = pixels * 4 + 4096;
+        const rgb_len = pixels * 3;
         const next = Buffers{
-            .scaled = try gpa.alloc(u32, pixels),
-            .zbuf = try gpa.alloc(u8, zlen),
-            .b64 = try gpa.alloc(u8, (zlen * 4 + 2) / 3 + 4),
+            .rgb = try gpa.alloc(u8, rgb_len),
+            .zbuf = try gpa.alloc(u8, rgb_len + 4096),
+            .b64 = try gpa.alloc(u8, ((rgb_len + 4096) * 4 + 2) / 3 + 4),
             .sx = try gpa.alloc(u16, l.out_w),
             .sy = try gpa.alloc(u16, l.out_h),
         };
@@ -373,6 +380,66 @@ fn eventOf(mods: []const u8, extra: ?[]const u8) u32 {
     return if (e != 0) e else if (extra) |s| num(s, 1) else 1;
 }
 
+// ---- shared memory ----------------------------------------------------------
+
+/// POSIX shared-memory helper for the Kitty `t=s` transmission medium. The
+/// terminal reads the object and unlinks it; we also unlink the previous frame's
+/// object defensively in case a terminal forgets.
+const Shm = struct {
+    name: [32]u8 = undefined,
+    name_len: usize = 0,
+    active: bool = false,
+
+    fn cname(s: *const Shm) [*:0]const u8 {
+        return @ptrCast(&s.name);
+    }
+
+    /// Unlink the object from the previous frame, if any.
+    fn cleanup(s: *Shm) void {
+        if (!s.active) return;
+        _ = std.c.shm_unlink(s.cname());
+        s.active = false;
+        s.name_len = 0;
+    }
+
+    /// Create a fresh object and copy `data` into it. Returns false on any
+    /// failure; the caller then falls back to direct transmission.
+    fn create(s: *Shm, seq: u32, data: []const u8) bool {
+        s.cleanup();
+        const name = std.fmt.bufPrint(&s.name, "/kex-{d}-{d}", .{ std.c.getpid(), seq }) catch return false;
+        if (name.len >= s.name.len) return false;
+        s.name[name.len] = 0; // null-terminate for shm_open/shm_unlink
+        s.name_len = name.len;
+
+        const flags: c_int = @bitCast(std.c.O{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true });
+        const fd = std.c.shm_open(s.cname(), flags, @as(std.c.mode_t, 0o600));
+        if (fd < 0) {
+            s.active = false;
+            return false;
+        }
+        defer _ = std.c.close(fd);
+
+        if (std.c.ftruncate(fd, @intCast(data.len)) != 0) {
+            s.active = false;
+            return false;
+        }
+        const map = posix.mmap(null, data.len, .{ .READ = true, .WRITE = true }, std.c.MAP{ .TYPE = .SHARED }, fd, 0) catch {
+            s.active = false;
+            return false;
+        };
+        defer posix.munmap(map);
+        @memcpy(map, data);
+
+        s.active = true;
+        return true;
+    }
+
+    /// base64-encode the object name into `out`, returning the encoded slice.
+    fn encodedName(s: *const Shm, out: []u8) []const u8 {
+        return std.base64.standard.Encoder.encode(out, s.name[0..s.name_len]);
+    }
+};
+
 // ---- backend ----------------------------------------------------------------
 
 pub const Backend = struct {
@@ -393,6 +460,12 @@ pub const Backend = struct {
     dirty: ?Rect = null,
     /// Bound live images so the terminal never evicts the base frame.
     partial_count: u32 = 0,
+    /// True when the terminal accepted a t=s probe and we are not on SSH.
+    use_shm: bool = false,
+    shm: Shm = .{},
+    shm_seq: u32 = 0,
+    /// Scratch for base64-encoding the (short) shared-memory object name.
+    shm_name_b64: [48]u8 = undefined,
 
     pub fn init(cfg: backend.Config) !Backend {
         const now = nowNs(cfg.io);
@@ -409,6 +482,7 @@ pub const Backend = struct {
         };
         const cell = try self.detect();
         if (terminalSize()) |ws| self.layout = Layout.compute(ws.col, ws.row, cell.w, cell.h);
+        self.use_shm = self.probeShm();
         try self.buffers.alloc(cfg.gpa, self.layout);
         self.parser = Parser.init(self.layout);
 
@@ -459,7 +533,40 @@ pub const Backend = struct {
         return cell;
     }
 
+    /// Probe whether the terminal can read shared memory. We create a tiny
+    /// object and ask the terminal to query-load it; an "OK" reply means t=s
+    /// works. Over SSH the object would be on the wrong machine, so skip it.
+    fn probeShm(b: *Backend) bool {
+        if (b.cfg.environ.getPosix("SSH_TTY") != null or
+            b.cfg.environ.getPosix("SSH_CONNECTION") != null or
+            b.cfg.environ.getPosix("SSH_CLIENT") != null) return false;
+
+        var probe = Shm{};
+        const pixel = [3]u8{ 0, 0, 0 };
+        if (!probe.create(0, &pixel)) return false;
+        defer probe.cleanup();
+
+        const name_b64 = probe.encodedName(&b.shm_name_b64);
+        b.out.writeAll(apc ++ "a=q,t=s,f=24,s=1,v=1,i=");
+        b.out.print("{d};", .{shm_probe_id});
+        b.out.writeAll(name_b64);
+        b.out.writeAll(apc_end);
+        b.out.flush();
+
+        var expected_buf: [32]u8 = undefined;
+        const expected = std.fmt.bufPrint(&expected_buf, "i={d};OK", .{shm_probe_id}) catch return false;
+        var buf: [512]u8 = undefined;
+        var len: usize = 0;
+        for (0..50) |_| {
+            if (!inputReady(10)) continue;
+            if (len < buf.len) len += sysRead(0, buf[len..]);
+            if (std.mem.indexOf(u8, buf[0..len], expected) != null) return true;
+        }
+        return false;
+    }
+
     pub fn deinit(b: *Backend) void {
+        b.shm.cleanup();
         b.buffers.deinit(b.cfg.gpa);
         b.out.writeAll(leave_seq);
         b.out.flush();
@@ -551,33 +658,20 @@ pub const Backend = struct {
     fn send(b: *Backend, fb: []const u8, rect: Rect, full: bool) void {
         const l = b.layout;
         const box = Box.compute(l, rect);
-        const src = upscale(b, fb, box);
-        const frame = compress(b, src);
-        const encoded = std.base64.standard.Encoder.encode(b.buffers.b64, frame.data);
+        const rgb = upscale(b, fb, box);
+
         const col = l.off_col + @as(u16, @intCast(box.px0 / l.cell.w));
         const row = l.off_row + @as(u16, @intCast(box.py0 / l.cell.h));
         b.out.print("\x1b[{d};{d}H", .{ row, col });
 
         const id = b.next_id;
-        var pos: usize = 0;
-        var index: usize = 0;
-        while (pos < encoded.len) : (index += 1) {
-            const end = @min(pos + chunk_len, encoded.len);
-            const more = end < encoded.len;
-            if (index == 0) {
-                // No c/r: the image is already the exact pixel size of the
-                // cell rectangle, so the terminal displays it 1:1 (no blur).
-                b.out.print(apc ++ "a=T,i={d},f=32,s={d},v={d},q=1,C=1,m={d}{s};", .{
-                    id, box.rw, box.rh, @intFromBool(more), if (frame.compressed) ",o=z" else "",
-                });
-            } else {
-                b.out.print(apc ++ "q=1,m={d};", .{@intFromBool(more)});
-            }
-            b.out.writeAll(encoded[pos..end]);
-            b.out.writeAll(apc_end);
-            b.out.flush();
-            pos = end;
+        var placed = false;
+        if (b.use_shm) {
+            placed = b.sendShm(rgb, id, box);
+            if (!placed) b.use_shm = false; // permanent fallback after a failure
         }
+        if (!placed) b.sendDirect(rgb, id, box);
+
         // Delete only images fully covered by the new placement: the last
         // partial (union only grows), and the old base on a full refresh.
         if (!full and b.partial_id != 0) {
@@ -596,6 +690,46 @@ pub const Backend = struct {
             b.partial_count += 1;
         }
         b.next_id += 1;
+    }
+
+    /// Transmit the frame through a shared-memory object. A single short escape
+    /// sequence replaces the base64 payload and chunking of direct mode.
+    fn sendShm(b: *Backend, rgb: []const u8, id: u32, box: Box) bool {
+        b.shm_seq += 1;
+        if (!b.shm.create(b.shm_seq, rgb)) return false;
+        const name_b64 = b.shm.encodedName(&b.shm_name_b64);
+        b.out.writeAll(apc ++ "a=T,t=s,f=24,s=");
+        b.out.print("{d},v={d},i={d},q=1,C=1;", .{ box.rw, box.rh, id });
+        b.out.writeAll(name_b64);
+        b.out.writeAll(apc_end);
+        b.out.flush();
+        return true;
+    }
+
+    /// zlib-compress and base64-encode the RGB frame, sending it as chunked
+    /// direct-mode APC placements.
+    fn sendDirect(b: *Backend, rgb: []const u8, id: u32, box: Box) void {
+        const frame = compress(b, rgb);
+        const encoded = std.base64.standard.Encoder.encode(b.buffers.b64, frame.data);
+        var pos: usize = 0;
+        var index: usize = 0;
+        while (pos < encoded.len) : (index += 1) {
+            const end = @min(pos + chunk_len, encoded.len);
+            const more = end < encoded.len;
+            if (index == 0) {
+                // No c/r: the image is already the exact pixel size of the
+                // cell rectangle, so the terminal displays it 1:1 (no blur).
+                b.out.print(apc ++ "a=T,i={d},f=24,s={d},v={d},q=1,C=1,m={d}{s};", .{
+                    id, box.rw, box.rh, @intFromBool(more), if (frame.compressed) ",o=z" else "",
+                });
+            } else {
+                b.out.print(apc ++ "q=1,m={d};", .{@intFromBool(more)});
+            }
+            b.out.writeAll(encoded[pos..end]);
+            b.out.writeAll(apc_end);
+            b.out.flush();
+            pos = end;
+        }
     }
 
     /// Absolute-deadline pacing: 60 cart ticks even if a frame is dropped.
@@ -639,23 +773,36 @@ const Box = struct {
     }
 };
 
-/// Pixel-perfect nearest-neighbour upscale of just the dirty rectangle.
+/// Pixel-perfect nearest-neighbour upscale of just the dirty rectangle,
+/// writing RGB triplets (the framebuffer's alpha byte is always 0xff).
 fn upscale(b: *Backend, fb_bytes: []const u8, box: Box) []const u8 {
     const bufs = &b.buffers;
     const src: []const u32 = @ptrCast(@alignCast(fb_bytes));
+    const out = bufs.rgb;
     if (b.layout.out_w == W and b.layout.out_h == H) {
         for (0..box.rh) |y| {
             const so = (box.py0 + y) * W + box.px0;
-            @memcpy(bufs.scaled[y * box.rw ..][0..box.rw], src[so..][0..box.rw]);
+            for (0..box.rw) |x| {
+                const p = src[so + x];
+                const o = (y * box.rw + x) * 3;
+                out[o] = @truncate(p);
+                out[o + 1] = @truncate(p >> 8);
+                out[o + 2] = @truncate(p >> 16);
+            }
         }
     } else {
         for (0..box.rh) |y| {
             const sy: usize = bufs.sy[box.py0 + y];
-            const row = bufs.scaled[y * box.rw ..][0..box.rw];
-            for (0..box.rw) |x| row[x] = src[sy * W + bufs.sx[box.px0 + x]];
+            for (0..box.rw) |x| {
+                const p = src[sy * W + bufs.sx[box.px0 + x]];
+                const o = (y * box.rw + x) * 3;
+                out[o] = @truncate(p);
+                out[o + 1] = @truncate(p >> 8);
+                out[o + 2] = @truncate(p >> 16);
+            }
         }
     }
-    return std.mem.sliceAsBytes(bufs.scaled[0 .. box.rw * box.rh]);
+    return out[0 .. box.rw * box.rh * 3];
 }
 
 fn compress(b: *Backend, src: []const u8) FrameData {
