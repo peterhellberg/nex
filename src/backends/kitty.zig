@@ -23,8 +23,10 @@ const cell_fallback: Cell = .{ .w = 10, .h = 20 };
 const apc = "\x1b_G";
 const apc_end = "\x1b\\";
 const query = apc ++ "i=31,s=1,v=1,a=q,t=d,f=24;AAAA" ++ apc_end ++ "\x1b[c\x1b[16t";
-const enter_seq = "\x1b[?1049h\x1b[?25l\x1b[0m\x1b[2J\x1b[H\x1b[>3u\x1b[?1002h\x1b[?1006h";
-const leave_seq = "\x1b[<u\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l";
+const enter_alt = "\x1b[?1049h";
+const leave_alt = "\x1b[?1049l";
+const enter_seq = "\x1b[?25l\x1b[0m\x1b[2J\x1b[H\x1b[>3u\x1b[?1002h\x1b[?1006h";
+const leave_seq = "\x1b[<u\x1b[?1002l\x1b[?1006l\x1b[?25h" ++ leave_alt;
 // Reused across frames; frame-sized scratch is allocated per terminal size.
 var history: [std.compress.flate.max_window_len]u8 = undefined;
 var compressor: std.compress.flate.Compress = undefined;
@@ -416,7 +418,11 @@ pub const Backend = struct {
 
     /// Query action + DA1 + cell size. The query reply is the support test;
     /// DA1 and CSI 16t bound the read on terminals without graphics support.
+    /// The query runs in the alternate screen: terminals that don't understand
+    /// APC (e.g. Terminal.app, iTerm2) render its payload as literal text, which
+    /// is discarded when we restore the main screen on failure.
     fn detect(b: *Backend) !Cell {
+        b.out.writeAll(enter_alt);
         b.out.writeAll(query);
         b.out.flush();
         var len: usize = 0;
@@ -428,10 +434,15 @@ pub const Backend = struct {
         }
         const buf = detect_buf[0..len];
         if (std.mem.indexOf(u8, buf, apc ++ "i=31;OK" ++ apc_end) == null) {
+            b.out.writeAll(leave_alt);
+            b.out.flush();
             std.debug.print("nex: terminal does not support the kitty graphics protocol\n", .{});
             return error.GraphicsUnsupported;
         }
-        return parseCellSize(buf) orelse cell_fallback;
+        const cell = parseCellSize(buf) orelse cell_fallback;
+        // Keep the alternate screen for the session; the rest of enter_seq is
+        // written by init().
+        return cell;
     }
 
     pub fn deinit(b: *Backend) void {
