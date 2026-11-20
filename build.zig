@@ -134,7 +134,7 @@ pub fn build(b: *std.Build) void {
     // The core files don't touch raylib, so tests never compile it. cart.zig
     // needs wasm3 for its bindings.
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/gfx.zig", "src/input.zig", "src/synth.zig", "src/kitty_test.zig" }) |path| {
+    for ([_][]const u8{ "src/gfx.zig", "src/input.zig", "src/synth.zig", "src/input_tape.zig", "src/kitty_test.zig" }) |path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,

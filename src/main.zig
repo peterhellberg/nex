@@ -8,6 +8,7 @@
 //!   -n, --frames N   run N frames headless, then print a report
 //!   -t, --trace      with -n, print a line per framebuffer change
 //!   --dump FILE      with -n, write the raw RGBA framebuffer to FILE
+//!   -i, --input FILE  with -n, script input from a tape (or `-` for stdin)
 //!
 //! Window mode runs the cart at a fixed 60 ticks per second with keyboard,
 //! gamepad, mouse and audio. Headless mode has no window and no audio and
@@ -32,6 +33,7 @@ const gfx = @import("gfx.zig");
 const Console = @import("Console.zig");
 const Synth = @import("synth.zig").Synth;
 const Cart = @import("cart.zig").Cart;
+const input_tape = @import("input_tape.zig");
 const build_options = @import("build_options");
 const Backend = if (std.mem.eql(u8, build_options.backend, "kitty"))
     @import("backends/kitty.zig").Backend
@@ -56,10 +58,11 @@ const Options = struct {
     trace: bool = false,
     frames: ?u64 = null,
     dump_path: ?[]const u8 = null,
+    input_path: ?[]const u8 = null,
 };
 
 fn usage() void {
-    std.debug.print("usage: {s} [-s scale] [-w] [-n frames] [-t] [--dump file] <cart.wasm>\n", .{if (std.mem.eql(u8, build_options.backend, "kitty")) "kex" else "nex"});
+    std.debug.print("usage: {s} [-s scale] [-w] [-n frames] [-t] [--dump file] [-i tape] <cart.wasm>\n", .{if (std.mem.eql(u8, build_options.backend, "kitty")) "kex" else "nex"});
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -113,6 +116,11 @@ fn parseArgs(init: std.process.Init) !Options {
                 std.debug.print("nex: {s} requires a file path\n", .{a});
                 return error.Usage;
             };
+        } else if (eql(a, "-i") or eql(a, "--input")) {
+            opts.input_path = it.next() orelse {
+                std.debug.print("nex: {s} requires a file path\n", .{a});
+                return error.Usage;
+            };
         } else if (a.len > 0 and a[0] == '-') {
             std.debug.print("nex: unknown option {s}\n", .{a});
             return error.Usage;
@@ -121,6 +129,10 @@ fn parseArgs(init: std.process.Init) !Options {
         }
     }
     opts.cart_path = cart_path orelse return error.Usage;
+    if (opts.input_path != null and opts.frames == null) {
+        std.debug.print("nex: -i/--input only applies to headless runs (-n)\n", .{});
+        return error.Usage;
+    }
     return opts;
 }
 
@@ -222,14 +234,21 @@ fn headless(io: std.Io, cart: *Cart, opts: Options, frames: u64) !u8 {
     var w = std.Io.File.stdout().writer(io, &buf);
     const out = &w.interface;
 
+    var tape: input_tape.Tape = .{};
+    if (opts.input_path) |path| {
+        if (input_tape.load(std.heap.page_allocator, io, path, &tape) == null) return 1;
+    }
+
     const t0 = std.Io.Timestamp.now(io, .awake);
     var prev = Fnv.hash(console.gfx.bytes());
     var changes: u64 = 0;
     for (0..frames) |i| {
+        tape.apply(i + 1, &console.input);
         cart.update() catch {
             out.flush() catch {};
             return 1;
         };
+        console.input.endTick();
         const h = Fnv.hash(console.gfx.bytes());
         if (h != prev) {
             changes += 1;
