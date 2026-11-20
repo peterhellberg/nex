@@ -483,6 +483,12 @@ pub const Backend = struct {
         const cell = try self.detect();
         if (terminalSize()) |ws| self.layout = Layout.compute(ws.col, ws.row, cell.w, cell.h);
         self.use_shm = self.probeShm();
+        if (cfg.environ.getPosix("KEX_TRACE") != null) {
+            std.debug.print("kex: graphics transport: {s}, cell: {d}x{d}\n", .{
+                if (self.use_shm) "shared memory (t=s)" else "direct (t=d)",
+                cell.w, cell.h,
+            });
+        }
         try self.buffers.alloc(cfg.gpa, self.layout);
         self.parser = Parser.init(self.layout);
 
