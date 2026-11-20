@@ -225,6 +225,18 @@ const Pacer = struct {
 
 const keys = [6]c_int{ rl.KEY_LEFT, rl.KEY_RIGHT, rl.KEY_UP, rl.KEY_DOWN, rl.KEY_Z, rl.KEY_X };
 
+// raylib 6.2's bundled GLFW mapping database has no entry for the 8BitDo
+// Ultimate 2C Wireless (VID 2dc8 / PID 301b), so over Bluetooth it connects
+// as a gamepad but reports no buttons or stick movement. Load the known-good
+// SDL mapping at startup; SetGamepadMappings() is additive, so other pads keep
+// their built-in mappings.
+const extra_gamepad_mappings =
+    "03000000c82d00001b30000001000000,8BitDo Ultimate 2C," ++
+    "a:b0,b:b1,back:b10,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1," ++
+    "guide:b12,leftshoulder:b6,leftstick:b13,lefttrigger:a5,leftx:a0,lefty:a1," ++
+    "paddle1:b5,paddle2:b2,rightshoulder:b7,rightstick:b14,righttrigger:a4," ++
+    "rightx:a2,righty:a3,start:b11,x:b3,y:b4,platform:Mac OS X,";
+
 // GLFW remaps every pad to the Xbox layout: the d-pad maps onto the arrows,
 // Z/X onto the bottom/right face buttons (A/B), with LB/RB as alternates.
 // GAMEPAD_BUTTON_UNKNOWN pads single bindings: no pad ever reports it.
@@ -323,6 +335,7 @@ pub const Backend = struct {
         if (builtin.os.tag == .windows) rl.SetConfigFlags(rl.FLAG_WINDOW_RESIZABLE);
         rl.InitWindow(W * cfg.scale, H * cfg.scale, cfg.console.title().ptr);
         errdefer rl.CloseWindow();
+        _ = rl.SetGamepadMappings(extra_gamepad_mappings);
         // No raylib frame limiter: Pacer presents on an absolute 60 Hz schedule.
         rl.SetTargetFPS(0);
 
