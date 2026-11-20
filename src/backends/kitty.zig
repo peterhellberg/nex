@@ -335,8 +335,18 @@ const Parser = struct {
         p.mouse_x = p.layout.mouseAxis(true, @intCast(x));
         p.mouse_y = p.layout.mouseAxis(false, @intCast(y));
         if ((b & 32) != 0) return; // motion: coords only
-        const which = b & 3;
-        const bit: u8 = @as(u8, 1) << @intCast(which);
+        // SGR 1006 reports 0=left, 1=middle, 2=right; the VEX cart convention
+        // is 0=left, 1=right, 2=middle. Swap middle/right to match the other
+        // hosts. Code 3 means "no button" (release all).
+        const sgr = b & 3;
+        const which: u3 = switch (sgr) {
+            0 => 0,
+            1 => 2,
+            2 => 1,
+            3 => 3,
+            else => unreachable,
+        };
+        const bit: u8 = @as(u8, 1) << which;
         if (which == 3) {
             p.mouse = 0;
         } else if (down) {
@@ -877,5 +887,16 @@ test "SGR mouse maps cells into the framebuffer" {
     try t.expectEqual(@as(i32, 5), p.mouse_x);
     try t.expectEqual(@as(i32, 10), p.mouse_y);
     p.feed("\x1b[<0;10;5m");
+    try t.expectEqual(@as(u8, 0), p.mouse);
+
+    // SGR 1006: 1=middle, 2=right. The cart convention is 1=right, 2=middle,
+    // so they must be swapped to match the other hosts.
+    p.feed("\x1b[<1;10;5M");
+    try t.expectEqual(@as(u8, 1 << 2), p.mouse); // middle -> cart bit 2
+    p.feed("\x1b[<1;10;5m");
+    try t.expectEqual(@as(u8, 0), p.mouse);
+    p.feed("\x1b[<2;10;5M");
+    try t.expectEqual(@as(u8, 1 << 1), p.mouse); // right -> cart bit 1
+    p.feed("\x1b[<2;10;5m");
     try t.expectEqual(@as(u8, 0), p.mouse);
 }
