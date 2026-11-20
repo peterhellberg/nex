@@ -14,6 +14,7 @@ pub const Config = struct {
     synth: *Synth,
     io: std.Io,
     gpa: std.mem.Allocator,
+    environ: std.process.Environ,
     scale: i32,
 };
 

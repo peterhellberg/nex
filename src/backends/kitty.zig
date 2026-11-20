@@ -25,6 +25,7 @@ const apc_end = "\x1b\\";
 const query = apc ++ "i=31,s=1,v=1,a=q,t=d,f=24;AAAA" ++ apc_end ++ "\x1b[c\x1b[16t";
 const enter_alt = "\x1b[?1049h";
 const leave_alt = "\x1b[?1049l";
+const unsupported_msg = "nex: terminal does not support the kitty graphics protocol well enough\r\n";
 const enter_seq = "\x1b[?25l\x1b[0m\x1b[2J\x1b[H\x1b[>3u\x1b[?1002h\x1b[?1006h";
 const leave_seq = "\x1b[<u\x1b[?1002l\x1b[?1006l\x1b[?25h" ++ leave_alt;
 // Reused across frames; frame-sized scratch is allocated per terminal size.
@@ -416,12 +417,25 @@ pub const Backend = struct {
         return self;
     }
 
+    /// Terminals that can't support KGP render the query's APC payload as
+    /// literal text. Skip the query entirely for the ones we can identify so
+    /// they never see that garbage, even transiently.
+    fn knownUnsupported(environ: std.process.Environ) bool {
+        const prog = environ.getPosix("TERM_PROGRAM") orelse return false;
+        return std.mem.eql(u8, prog, "Apple_Terminal") or
+            std.mem.eql(u8, prog, "iTerm.app");
+    }
+
     /// Query action + DA1 + cell size. The query reply is the support test;
     /// DA1 and CSI 16t bound the read on terminals without graphics support.
-    /// The query runs in the alternate screen: terminals that don't understand
-    /// APC (e.g. Terminal.app, iTerm2) render its payload as literal text, which
-    /// is discarded when we restore the main screen on failure.
+    /// The query runs in the alternate screen: terminals whose support can't be
+    /// determined ahead of time render any literal payload there, which is
+    /// discarded when we restore the main screen on failure.
     fn detect(b: *Backend) !Cell {
+        if (knownUnsupported(b.cfg.environ)) {
+            std.debug.print(unsupported_msg, .{});
+            return error.GraphicsUnsupported;
+        }
         b.out.writeAll(enter_alt);
         b.out.writeAll(query);
         b.out.flush();
@@ -436,7 +450,7 @@ pub const Backend = struct {
         if (std.mem.indexOf(u8, buf, apc ++ "i=31;OK" ++ apc_end) == null) {
             b.out.writeAll(leave_alt);
             b.out.flush();
-            std.debug.print("nex: terminal does not support the kitty graphics protocol\n", .{});
+            std.debug.print(unsupported_msg, .{});
             return error.GraphicsUnsupported;
         }
         const cell = parseCellSize(buf) orelse cell_fallback;

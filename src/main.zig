@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (opts.frames) |n| return headless(io, &cart, opts, n);
 
-    runWindow(gpa, io, &cart, opts, loaded.signature) catch return 1;
+    runWindow(gpa, io, init.minimal.environ, &cart, opts, loaded.signature) catch return 1;
     return 0;
 }
 
@@ -260,12 +260,13 @@ fn headless(io: std.Io, cart: *Cart, opts: Options, frames: u64) !u8 {
 
 // ---- platform loop ----------------------------------------------------------
 
-fn runWindow(gpa: std.mem.Allocator, io: std.Io, cart: *Cart, opts: Options, initial_signature: u64) !void {
+fn runWindow(gpa: std.mem.Allocator, io: std.Io, environ: std.process.Environ, cart: *Cart, opts: Options, initial_signature: u64) !void {
     var backend = try Backend.init(.{
         .console = &console,
         .synth = &synth,
         .io = io,
         .gpa = gpa,
+        .environ = environ,
         .scale = opts.scale,
     });
     defer backend.deinit();
